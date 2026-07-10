@@ -1459,7 +1459,7 @@ async def anthropic_messages(
             str(e), status=401, err_type="authentication_error"
         )
 
-    body = anth.build_openai_chat_body(
+    body, wants_search = anth.build_openai_chat_body(
         req, model, force_stream=FORCE_UPSTREAM_STREAM
     )
     # Always stream upstream when forced; client may still want non-stream response
@@ -1468,6 +1468,35 @@ async def anthropic_messages(
     url = f"{UPSTREAM_BASE}/chat/completions"
 
     if req.stream:
+        if wants_search:
+            return StreamingResponse(
+                _stream_anthropic_search_agent(
+                    url=url,
+                    body=body,
+                    chain=chain,
+                    message_id=message_id,
+                    model=model,
+                    client_disconnected=request.is_disconnected,
+                    conversation_fp=conv_fp,
+                    prefer_account=prefer_account,
+                    original_messages=anth.anthropic_messages_to_openai(req.messages, system=req.system),
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Grok2API-Protocol": "anthropic",
+                    "X-Grok2API-Accounts": str(len(chain)),
+                    "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                    "X-Grok2API-Search": "1",
+                    **(
+                        {"X-Grok2API-Conversation-Fp": conv_fp}
+                        if conv_fp
+                        else {}
+                    ),
+                },
+            )
         return StreamingResponse(
             _stream_anthropic_with_failover(
                 url=url,
@@ -1492,6 +1521,18 @@ async def anthropic_messages(
                     else {}
                 ),
             },
+        )
+
+    if wants_search:
+        return await _non_stream_anthropic_search_agent(
+            url=url,
+            body=body,
+            chain=chain,
+            message_id=message_id,
+            model=model,
+            conversation_fp=conv_fp,
+            prefer_account=prefer_account,
+            original_messages=anth.anthropic_messages_to_openai(req.messages, system=req.system),
         )
 
     last_error: str | None = None
@@ -1724,6 +1765,257 @@ async def _stream_anthropic_with_failover(
     yield anth.anthropic_stream_error(
         last_err or "All accounts failed", err_type="api_error"
     )
+
+
+async def _non_stream_anthropic_search_agent(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    message_id: str,
+    model: str,
+    conversation_fp: str | None,
+    prefer_account: bool,
+    original_messages: list[dict[str, Any]],
+) -> JSONResponse:
+    """Non-stream Anthropic search: get tool_use, run search, return final message."""
+    first_tried = chain[0].auth_key if chain else None
+    assistant_message: dict[str, Any] | None = None
+    tool_uses: list[dict[str, Any]] = []
+
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        round_body = {**body, "messages": original_messages}
+        try:
+            content, reasoning, finish, usage, tool_calls = await _collect_completion(
+                url=url, headers=headers, body=round_body
+            )
+            account_pool.report_success(creds.auth_key)
+            if conversation_fp:
+                if prefer_account and prefer_account != creds.auth_key:
+                    conversation_affinity.rebind_on_failover(
+                        conversation_fp, first_tried, creds.auth_key
+                    )
+                else:
+                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
+            if tool_calls:
+                assistant_message = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": tool_calls,
+                    "reasoning_content": reasoning or None,
+                }
+                tool_uses = anth.openai_tool_calls_to_content_blocks(tool_calls)
+                break
+            return JSONResponse(
+                content=anth.openai_completion_to_anthropic(
+                    content=content or "",
+                    reasoning=reasoning or "",
+                    finish=finish,
+                    usage=usage,
+                    model=model,
+                    message_id=message_id,
+                )
+            )
+        except Exception:
+            continue
+
+    if not assistant_message or not tool_uses:
+        return _anthropic_error_response("Search agent failed to get tool_use", status=502)
+
+    openai_tool_calls = web_search_tool.anthropic_tool_use_to_openai(tool_uses)
+    search_results = await web_search_tool.execute_search_tool_calls(openai_tool_calls)
+
+    messages = original_messages
+    for tu in tool_uses:
+        tuid = tu.get("id") or ""
+        result_text = search_results.get(tuid) or "未找到搜索结果"
+        messages = web_search_tool.anthropic_messages_with_tool_result(
+            messages, assistant_message, tuid, result_text
+        )
+
+    final_body = {**body, "messages": messages}
+    last_error = "All accounts failed in search final step"
+    last_status = 502
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        try:
+            content, reasoning, finish, usage, _ = await _collect_completion(
+                url=url, headers=headers, body=final_body
+            )
+            account_pool.report_success(creds.auth_key)
+            result = anth.openai_completion_to_anthropic(
+                content=content or "",
+                reasoning=reasoning or "",
+                finish=finish,
+                usage=usage,
+                model=model,
+                message_id=message_id,
+            )
+            result["x_grok2api_account"] = creds.email or creds.auth_key
+            result["x_grok2api_affinity"] = bool(prefer_account)
+            if conversation_fp:
+                result["x_grok2api_conversation_fp"] = conversation_fp
+            return JSONResponse(content=result)
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 502
+            last_error = e.response.text[:500] if e.response is not None else str(e)
+            last_status = code
+            if not _retryable_status(code):
+                break
+            continue
+        except Exception as e:
+            last_error = str(e)
+            last_status = 502
+            continue
+
+    return _anthropic_error_response(last_error, status=last_status)
+
+
+async def _stream_anthropic_search_agent(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    message_id: str,
+    model: str,
+    client_disconnected,
+    conversation_fp: str | None,
+    prefer_account: bool,
+    original_messages: list[dict[str, Any]],
+) -> AsyncIterator[str]:
+    """Stream Anthropic search: emit tool_use, run search, stream final answer."""
+    first_tried = chain[0].auth_key if chain else None
+    assistant_message: dict[str, Any] | None = None
+    tool_uses: list[dict[str, Any]] = []
+
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        round_body = {**body, "messages": original_messages}
+        try:
+            content, reasoning, finish, usage, tool_calls = await _collect_completion(
+                url=url, headers=headers, body=round_body
+            )
+            account_pool.report_success(creds.auth_key)
+            if conversation_fp:
+                if prefer_account and prefer_account != creds.auth_key:
+                    conversation_affinity.rebind_on_failover(
+                        conversation_fp, first_tried, creds.auth_key
+                    )
+                else:
+                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
+            if tool_calls:
+                assistant_message = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": tool_calls,
+                    "reasoning_content": reasoning or None,
+                }
+                tool_uses = anth.openai_tool_calls_to_content_blocks(tool_calls)
+            break
+        except Exception:
+            continue
+
+    if not assistant_message or not tool_uses:
+        yield anth.anthropic_stream_error("Search agent failed to get tool_use", err_type="api_error")
+        return
+
+    # Emit message_start + tool_use blocks + stop_reason=tool_use
+    yield anth.anthropic_stream_message_start(message_id=message_id, model=model)
+    yield anth.anthropic_stream_block_start_text(0)
+    if assistant_message.get("reasoning_content"):
+        # Anthropic spec: thinking is its own block before text; simplify by putting reasoning into text
+        pass
+    if assistant_message.get("content"):
+        yield anth.anthropic_stream_text_delta(0, assistant_message["content"])
+    yield anth.anthropic_stream_block_stop(0)
+    idx = 1
+    for tu in tool_uses:
+        yield anth.anthropic_stream_block_start_tool(
+            idx,
+            tool_id=tu.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+            name=tu.get("name") or "web_search",
+        )
+        inp = tu.get("input") or {}
+        yield anth.anthropic_stream_input_json_delta(
+            idx, partial_json=json.dumps(inp, ensure_ascii=False)
+        )
+        yield anth.anthropic_stream_block_stop(idx)
+        idx += 1
+    yield anth.anthropic_stream_message_delta(stop_reason="tool_use")
+    yield anth.anthropic_stream_message_stop()
+
+    openai_tool_calls = web_search_tool.anthropic_tool_use_to_openai(tool_uses)
+    search_results = await web_search_tool.execute_search_tool_calls(openai_tool_calls)
+
+    messages = original_messages
+    for tu in tool_uses:
+        tuid = tu.get("id") or ""
+        result_text = search_results.get(tuid) or "未找到搜索结果"
+        messages = web_search_tool.anthropic_messages_with_tool_result(
+            messages, assistant_message, tuid, result_text
+        )
+
+    final_body = {**body, "messages": messages}
+    for idx2, creds in enumerate(chain):
+        headers = upstream_headers(creds.token, model)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
+                async with client.stream("POST", url, headers=headers, json=final_body) as resp:
+                    if resp.status_code >= 400:
+                        err_text = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                        if _retryable_status(resp.status_code) and idx2 < len(chain) - 1:
+                            continue
+                        yield anth.anthropic_stream_error(f"Upstream {resp.status_code}: {err_text}")
+                        return
+                    assembler = anth.AnthropicStreamAssembler(message_id=message_id, model=model)
+                    for ev in assembler.start():
+                        yield ev
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if "text/event-stream" in ctype or "stream" in ctype:
+                        async for line in resp.aiter_lines():
+                            if await client_disconnected():
+                                return
+                            parsed = _parse_sse_line(line)
+                            if parsed is None or parsed == "[DONE]":
+                                continue
+                            c, r, tc_delta = _extract_delta_parts(parsed)
+                            if c or r or tc_delta:
+                                for ev in assembler.feed(content=c or None, reasoning=r or None, tool_calls=tc_delta):
+                                    yield ev
+                            choices = parsed.get("choices") or []
+                            if choices and choices[0].get("finish_reason"):
+                                for ev in assembler.finish(choices[0]["finish_reason"]):
+                                    yield ev
+                                return
+                    else:
+                        raw = await resp.aread()
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            text = raw.decode("utf-8", errors="replace")
+                            for ev in assembler.feed(content=text):
+                                yield ev
+                            for ev in assembler.finish("stop"):
+                                yield ev
+                            return
+                        c, r, tc_delta = _extract_delta_parts(data)
+                        if c or r or tc_delta:
+                            for ev in assembler.feed(content=c or None, reasoning=r or None, tool_calls=tc_delta):
+                                yield ev
+                        choices = data.get("choices") or []
+                        fr = choices[0].get("finish_reason") if choices else "stop"
+                        for ev in assembler.finish(fr or "stop"):
+                            yield ev
+                        return
+            return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            if idx2 < len(chain) - 1:
+                continue
+            yield anth.anthropic_stream_error("Search final step failed")
+            return
 
 
 # Mount static assets if present (css/js under /static)
