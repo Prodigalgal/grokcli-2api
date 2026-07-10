@@ -74,6 +74,41 @@ PROBE_MODELS: list[str] = (
     else [DEFAULT_MODEL]
 )
 
+# Large multi-account pools (hundreds of entries) can freeze WSL/low-RAM hosts
+# if startup fans out network + rewrites 1MB auth.json per account.
+# These caps keep peak concurrency / I/O bounded.
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+    try:
+        v = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    return max(minimum, min(maximum, v))
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        v = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        v = default
+    return max(minimum, v)
+
+
+# Concurrent OIDC refresh / model probe / quota / SSO-import workers
+TOKEN_REFRESH_WORKERS = _env_int("GROK2API_TOKEN_REFRESH_WORKERS", 4, maximum=16)
+MODEL_PROBE_WORKERS = _env_int("GROK2API_MODEL_PROBE_WORKERS", 4, maximum=16)
+QUOTA_WORKERS = _env_int("GROK2API_QUOTA_WORKERS", 4, maximum=16)
+SSO_IMPORT_WORKERS = _env_int("GROK2API_SSO_IMPORT_WORKERS", 4, maximum=16)
+# Startup stagger: first background cycle waits longer with large pools
+TOKEN_MAINTAIN_STARTUP_DELAY = _env_float(
+    "GROK2API_TOKEN_MAINTAIN_STARTUP_DELAY", 30.0, minimum=5.0
+)
+MODEL_HEALTH_STARTUP_DELAY = _env_float(
+    "GROK2API_MODEL_HEALTH_STARTUP_DELAY", 90.0, minimum=15.0
+)
+# Max accounts to refresh/probe per background cycle (rest deferred)
+TOKEN_REFRESH_BATCH = _env_int("GROK2API_TOKEN_REFRESH_BATCH", 40, maximum=500)
+MODEL_PROBE_BATCH = _env_int("GROK2API_MODEL_PROBE_BATCH", 40, maximum=500)
+
 # xAI OIDC (public client — device code + refresh; no local CLI binary)
 GROK_CLI_CLIENT_ID = os.getenv(
     "GROK2API_OIDC_CLIENT_ID",

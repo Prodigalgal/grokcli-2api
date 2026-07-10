@@ -146,26 +146,14 @@ def list_live_credentials(
     except AuthError:
         return []
 
-    if auto_refresh:
-        try:
-            from oidc_auth import ensure_fresh_entry
-
-            dirty = False
-            for name, entry, _exp in list(_iter_entries(data)):
-                try:
-                    new_entry = ensure_fresh_entry(
-                        name, entry, skew_seconds=TOKEN_REFRESH_SKEW
-                    )
-                    if new_entry is not entry and new_entry.get("key") != entry.get("key"):
-                        dirty = True
-                except Exception:
-                    continue
-            if dirty:
-                data = _read_auth(path)
-        except Exception:
-            pass
-
+    # IMPORTANT: never fan-out refresh across the whole pool here.
+    # With 700+ accounts this used to open hundreds of OIDC calls + rewrite
+    # auth.json per account and freeze WSL. Background token_maintainer owns
+    # bulk refresh; here we only refresh on demand for already-expired entries
+    # when explicitly requested, and only a small number per call.
     out: list[GrokCredentials] = []
+    refreshed = 0
+    max_inline_refresh = 3 if auto_refresh else 0
     for name, entry, _exp in _iter_entries(data):
         try:
             creds = _entry_to_creds(name, entry)
@@ -173,13 +161,19 @@ def list_live_credentials(
             continue
         # still usable if has refresh_token even when access near-expired
         if include_expired or not creds.expired or creds.refresh_token:
-            if creds.expired and creds.refresh_token and auto_refresh:
-                # try one more hard refresh for this entry
+            if (
+                auto_refresh
+                and creds.expired
+                and creds.refresh_token
+                and refreshed < max_inline_refresh
+            ):
+                # only hard-refresh a tiny number of already-expired entries
                 try:
                     from oidc_auth import refresh_and_persist
 
                     r = refresh_and_persist(name, entry)
                     creds = _entry_to_creds(r["account_id"], r["entry"])
+                    refreshed += 1
                 except Exception:
                     if not include_expired:
                         continue

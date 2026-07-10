@@ -286,10 +286,17 @@ def normalize_auth_file_keys() -> dict[str, Any]:
     return {"ok": True, "changed": changed, "total": len(new_map)}
 
 
-def refresh_access_token(entry: dict[str, Any]) -> dict[str, Any]:
+def refresh_access_token(
+    entry: dict[str, Any],
+    *,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
     """
     Exchange refresh_token for a new access_token (and rotated refresh_token).
     Raises ValueError / httpx.HTTPError on failure.
+
+    Pass a shared `client` when refreshing many accounts to avoid opening
+    hundreds of TLS sessions at once (WSL/low-RAM friendly).
     """
     rt = entry.get("refresh_token")
     if not rt:
@@ -303,15 +310,15 @@ def refresh_access_token(entry: dict[str, Any]) -> dict[str, Any]:
         "refresh_token": rt,
         "client_id": str(client_id),
     }
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(
-            OIDC_TOKEN_URL,
-            data=form,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code >= 400:
-            raise ValueError(f"refresh failed {resp.status_code}: {resp.text[:400]}")
-        data = resp.json()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if client is not None:
+        resp = client.post(OIDC_TOKEN_URL, data=form, headers=headers)
+    else:
+        with httpx.Client(timeout=30.0) as c:
+            resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
+    if resp.status_code >= 400:
+        raise ValueError(f"refresh failed {resp.status_code}: {resp.text[:400]}")
+    data = resp.json()
     if not isinstance(data, dict) or not data.get("access_token"):
         raise ValueError("invalid refresh response")
     return data
@@ -326,8 +333,20 @@ def _account_refresh_lock(account_id: str) -> threading.Lock:
         return lock
 
 
-def refresh_and_persist(account_id: str, entry: dict[str, Any]) -> dict[str, Any]:
-    """Refresh one account under a per-account lock (multi-account safe)."""
+def refresh_and_persist(
+    account_id: str,
+    entry: dict[str, Any],
+    *,
+    client: httpx.Client | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """
+    Refresh one account under a per-account lock (multi-account safe).
+
+    When `persist=False`, only performs the OIDC exchange and returns the new
+    entry — caller is responsible for a single batched write (startup bulk
+    refresh). This avoids rewriting a multi-MB auth.json once per account.
+    """
     lock = _account_refresh_lock(account_id)
     with lock:
         # re-read latest entry — another thread may have just refreshed
@@ -346,14 +365,15 @@ def refresh_and_persist(account_id: str, entry: dict[str, Any]) -> dict[str, Any
                         break
             if not isinstance(latest, dict):
                 latest = entry
-        token_data = refresh_access_token(latest)
+        token_data = refresh_access_token(latest, client=client)
         new_id, new_entry = entry_from_token_response(token_data, previous=latest)
         uid = new_entry.get("user_id")
         if uid:
             new_id = account_storage_id(user_id=str(uid))
         else:
             new_id = account_id
-        upsert_entry(new_id, new_entry)
+        if persist:
+            upsert_entry(new_id, new_entry)
         return {"account_id": new_id, "entry": new_entry}
 
 
@@ -625,10 +645,40 @@ def list_device_sessions() -> list[dict[str, Any]]:
         return [get_device_session(k) for k in list(_device_sessions.keys()) if get_device_session(k)]
 
 
-def refresh_all_accounts(*, only_near_expiry: bool = True, skew_seconds: float = 300.0) -> dict[str, Any]:
-    """Refresh every account that has refresh_token (optionally only near expiry)."""
+def refresh_all_accounts(
+    *,
+    only_near_expiry: bool = True,
+    skew_seconds: float = 300.0,
+    max_workers: int | None = None,
+    max_accounts: int | None = None,
+) -> dict[str, Any]:
+    """
+    Refresh accounts that have refresh_token (optionally only near expiry).
+
+    Designed for large pools (hundreds of accounts):
+      - bounded thread pool (default TOKEN_REFRESH_WORKERS)
+      - shared httpx client per worker (no 1-client-per-request storm)
+      - single batched auth.json write at the end (not one rewrite per account)
+      - optional max_accounts cap so a cycle never tries all 700 at once
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS
+    except Exception:
+        TOKEN_REFRESH_WORKERS = 4
+        TOKEN_REFRESH_BATCH = 40
+
+    if max_workers is None:
+        max_workers = TOKEN_REFRESH_WORKERS
+    if max_accounts is None:
+        max_accounts = TOKEN_REFRESH_BATCH
+
     data = read_auth_map()
-    results = []
+    results: list[dict[str, Any]] = []
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    now = time.time()
+
     for aid, entry in list(data.items()):
         if not isinstance(entry, dict):
             continue
@@ -636,24 +686,117 @@ def refresh_all_accounts(*, only_near_expiry: bool = True, skew_seconds: float =
             results.append({"id": aid, "ok": False, "error": "no refresh_token"})
             continue
         token = entry.get("key")
-        exp = parse_expires_at(entry.get("expires_at"), token if isinstance(token, str) else None)
-        if only_near_expiry and exp is not None and exp > time.time() + skew_seconds:
-            results.append({"id": aid, "ok": True, "skipped": True, "reason": "still_valid"})
+        exp = parse_expires_at(
+            entry.get("expires_at"), token if isinstance(token, str) else None
+        )
+        if only_near_expiry and exp is not None and exp > now + skew_seconds:
+            results.append(
+                {"id": aid, "ok": True, "skipped": True, "reason": "still_valid"}
+            )
             continue
-        try:
-            r = refresh_and_persist(aid, entry)
+        candidates.append((aid, entry))
+
+    # Prefer soonest-expiring accounts first when batch-capped
+    def _exp_key(item: tuple[str, dict[str, Any]]) -> float:
+        aid, entry = item
+        token = entry.get("key")
+        exp = parse_expires_at(
+            entry.get("expires_at"), token if isinstance(token, str) else None
+        )
+        return float(exp) if exp is not None else 0.0
+
+    candidates.sort(key=_exp_key)
+    deferred = 0
+    if max_accounts and len(candidates) > max_accounts:
+        deferred = len(candidates) - max_accounts
+        for aid, _ in candidates[max_accounts:]:
             results.append(
                 {
-                    "id": r["account_id"],
+                    "id": aid,
                     "ok": True,
-                    "email": r["entry"].get("email"),
-                    "expires_at": r["entry"].get("expires_at"),
+                    "skipped": True,
+                    "reason": "batch_deferred",
                 }
             )
+        candidates = candidates[:max_accounts]
+
+    updates: dict[str, dict[str, Any]] = {}
+    updates_lock = threading.Lock()
+
+    def _refresh_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        aid, entry = item
+        # One short-lived client per worker task is still better than unbounded
+        # fan-out; pool size is already capped by max_workers.
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                r = refresh_and_persist(aid, entry, client=client, persist=False)
+            with updates_lock:
+                updates[r["account_id"]] = r["entry"]
+                # Drop old key if remounted to a different storage id
+                if r["account_id"] != aid:
+                    updates.setdefault("__delete__", {})  # type: ignore[arg-type]
+            return {
+                "id": r["account_id"],
+                "ok": True,
+                "email": r["entry"].get("email"),
+                "expires_at": r["entry"].get("expires_at"),
+            }
         except Exception as e:  # noqa: BLE001
-            results.append({"id": aid, "ok": False, "error": str(e)[:300]})
+            return {"id": aid, "ok": False, "error": str(e)[:300]}
+
+    workers = max(1, min(int(max_workers or 1), max(1, len(candidates))))
+    if candidates:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="tok-refresh-"
+        ) as ex:
+            futs = [ex.submit(_refresh_one, c) for c in candidates]
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    results.append({"id": "?", "ok": False, "error": str(e)[:300]})
+
+    # Single batched write for all successful refreshes
+    if updates:
+        def _apply(m: dict[str, Any]) -> None:
+            for aid, entry in updates.items():
+                if aid == "__delete__" or not isinstance(entry, dict):
+                    continue
+                # remove any other keys with same user_id / token to avoid dupes
+                uid = entry.get("user_id") or entry.get("principal_id")
+                token = entry.get("key")
+                for k in list(m.keys()):
+                    if k == aid:
+                        continue
+                    v = m.get(k)
+                    if not isinstance(v, dict):
+                        continue
+                    same_user = bool(
+                        uid
+                        and (v.get("user_id") == uid or v.get("principal_id") == uid)
+                    )
+                    same_token = bool(token and v.get("key") == token)
+                    if same_user or same_token:
+                        del m[k]
+                m[aid] = entry
+
+        try:
+            mutate_auth_map(_apply)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": f"batch write failed: {e}"[:400],
+                "results": results,
+                "refreshed": 0,
+                "deferred": deferred,
+                "attempted": len(candidates),
+            }
+
     return {
         "ok": True,
         "results": results,
         "refreshed": sum(1 for r in results if r.get("ok") and not r.get("skipped")),
+        "deferred": deferred,
+        "attempted": len(candidates),
+        "workers": workers,
     }

@@ -1,0 +1,3 @@
+[submodule "grok-build-auth"]
+	path = grok-build-auth
+	url = https://github.com/dongguatanglinux/grok-build-auth.git

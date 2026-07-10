@@ -395,84 +395,44 @@ def build_openai_chat_body(
     model: str,
     *,
     force_stream: bool = False,
-) -> tuple[dict[str, Any], bool]:
-    """Build OpenAI-compatible chat.completions body for upstream.
-
-    Returns (body, wants_server_search). Server search is triggered when
-    grok-search model or web_search tools are requested.
-    """
+) -> dict[str, Any]:
+    """Build OpenAI-compatible chat.completions body for upstream."""
     messages = anthropic_messages_to_openai(req.messages, system=req.system)
-    is_search_model = (req.model or "").strip().lower() in ("grok-search", "web-search")
-
-    tools = anthropic_tools_to_openai(req.tools)
-    wants_search = is_search_model or _has_web_search_tool(req.tools)
-
-    if is_search_model:
-        if not tools:
-            tools = [_build_search_function_tool_for_anthropic()]
-        elif not any(
-            (t.get("function") or {}).get("name") == "web_search"
-            for t in tools
-            if isinstance(t, dict)
-        ):
-            tools = tools + [_build_search_function_tool_for_anthropic()]
-
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": True if force_stream else bool(req.stream),
         "max_tokens": req.max_tokens,
     }
+    tools = anthropic_tools_to_openai(req.tools)
     if tools:
         body["tools"] = tools
     tc = anthropic_tool_choice_to_openai(req.tool_choice)
     if tc is not None:
         body["tool_choice"] = tc
-    elif is_search_model:
-        body["tool_choice"] = "auto"
     if req.temperature is not None:
         body["temperature"] = req.temperature
     if req.top_p is not None:
         body["top_p"] = req.top_p
     if req.stop_sequences:
         body["stop"] = req.stop_sequences
+    # metadata.user_id → OpenAI user (affinity)
     if isinstance(req.metadata, dict) and req.metadata.get("user_id"):
         body["user"] = str(req.metadata["user_id"])
+    # Anthropic thinking → OpenAI reasoning_effort
     effort = _anthropic_thinking_to_reasoning_effort(req.thinking)
     if effort:
         body["reasoning_effort"] = effort
-    return body, wants_search
-
-
-def _has_web_search_tool(tools: list[Any] | None) -> bool:
-    if not tools:
-        return False
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        ttype = (t.get("type") or "").lower()
-        if ttype in ("web_search_preview", "web_search", "live_search"):
-            return True
-        if ttype == "function" and (t.get("function") or {}).get("name") in (
-            "web_search", "search", "live_search", "google_search",
-        ):
-            return True
-    return False
-
-
-def _build_search_function_tool_for_anthropic() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for current information.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search query"}},
-                "required": ["query"],
-            },
-        },
-    }
+    # Request final-chunk usage so secondary relays can bill correctly
+    if body.get("stream"):
+        opts = body.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+        else:
+            opts = dict(opts)
+        opts["include_usage"] = True
+        body["stream_options"] = opts
+    return body
 
 
 # ── response mapping ────────────────────────────────────────────────────────
@@ -563,16 +523,47 @@ def openai_completion_to_anthropic(
     input_tokens = 0
     output_tokens = 0
     if isinstance(usage, dict):
-        input_tokens = int(
-            usage.get("prompt_tokens")
-            or usage.get("input_tokens")
-            or 0
-        )
-        output_tokens = int(
-            usage.get("completion_tokens")
-            or usage.get("output_tokens")
-            or 0
-        )
+        try:
+            input_tokens = int(
+                usage.get("prompt_tokens")
+                or usage.get("input_tokens")
+                or 0
+            )
+        except (TypeError, ValueError):
+            input_tokens = 0
+        try:
+            output_tokens = int(
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or 0
+            )
+        except (TypeError, ValueError):
+            output_tokens = 0
+        # Some relays only provide total_tokens
+        if input_tokens <= 0 and output_tokens <= 0:
+            try:
+                total_only = int(usage.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                total_only = 0
+            if total_only > 0:
+                # Best-effort split: treat all as input if no completion signal
+                input_tokens = total_only
+
+    # Local fallback so secondary relays never show 0/0 usage
+    if output_tokens <= 0:
+        approx = 0
+        if content:
+            approx += max(1, (len(content) + 3) // 4)
+        if reasoning:
+            approx += max(1, (len(reasoning) + 3) // 4)
+        if tool_blocks:
+            try:
+                approx += max(
+                    1, (len(json.dumps(tool_blocks, ensure_ascii=False)) + 3) // 4
+                )
+            except (TypeError, ValueError):
+                pass
+        output_tokens = approx
 
     return {
         "id": message_id or f"msg_{uuid.uuid4().hex[:24]}",
@@ -583,8 +574,8 @@ def openai_completion_to_anthropic(
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
         },
     }
 
@@ -770,7 +761,12 @@ def anthropic_stream_message_delta(
     *,
     stop_reason: str,
     output_tokens: int = 0,
+    input_tokens: int | None = None,
 ) -> str:
+    usage: dict[str, Any] = {"output_tokens": int(output_tokens or 0)}
+    # Some secondary relays (sub2api) also read input_tokens from message_delta
+    if input_tokens is not None:
+        usage["input_tokens"] = int(input_tokens or 0)
     return _sse_event(
         "message_delta",
         {
@@ -779,7 +775,7 @@ def anthropic_stream_message_delta(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
             },
-            "usage": {"output_tokens": output_tokens},
+            "usage": usage,
         },
     )
 
@@ -955,10 +951,16 @@ class AnthropicStreamAssembler:
 
         return events
 
-    def finish(self, finish_reason: str | None = None) -> list[str]:
+    def finish(
+        self,
+        finish_reason: str | None = None,
+        *,
+        usage: dict[str, Any] | None = None,
+        input_tokens: int | None = None,
+    ) -> list[str]:
         events: list[str] = []
         if not self._started:
-            events.extend(self.start())
+            events.extend(self.start(input_tokens=int(input_tokens or 0)))
         events.extend(self._close_thinking())
         events.extend(self._close_text())
         for state in self._tools.values():
@@ -986,11 +988,40 @@ class AnthropicStreamAssembler:
         stop = map_finish_to_stop_reason(
             finish_reason, has_tool_calls=self._saw_tool
         )
-        # rough output token estimate from chars
-        out_tok = max(1, self._output_chars // 4) if self._output_chars else 0
+
+        # Prefer real upstream usage (OpenAI prompt/completion tokens)
+        out_tok = 0
+        in_tok = int(input_tokens or 0)
+        if isinstance(usage, dict):
+            try:
+                out_tok = int(
+                    usage.get("completion_tokens")
+                    or usage.get("output_tokens")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                out_tok = 0
+            try:
+                prompt = int(
+                    usage.get("prompt_tokens")
+                    or usage.get("input_tokens")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                prompt = 0
+            if prompt > 0:
+                in_tok = prompt
+        # Fallback: rough estimate from streamed chars when upstream omitted usage
+        if out_tok <= 0:
+            out_tok = (
+                max(1, self._output_chars // 4) if self._output_chars else 0
+            )
+
         events.append(
             anthropic_stream_message_delta(
-                stop_reason=stop, output_tokens=out_tok
+                stop_reason=stop,
+                output_tokens=out_tok,
+                input_tokens=in_tok if in_tok > 0 else None,
             )
         )
         events.append(anthropic_stream_message_stop())

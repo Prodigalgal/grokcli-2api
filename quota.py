@@ -422,10 +422,18 @@ def fetch_quota_by_account_id(account_id: str) -> dict[str, Any]:
 async def fetch_all_quotas(
     *,
     include_expired: bool = False,
-    max_workers: int = 16,
+    max_workers: int | None = None,
 ) -> dict[str, Any]:
     """Query quota for every live account concurrently; auto-disable exhausted ones."""
-    accounts = list_live_credentials(include_expired=include_expired, auto_refresh=True)
+    try:
+        from config import QUOTA_WORKERS
+    except Exception:
+        QUOTA_WORKERS = 4
+    if max_workers is None:
+        max_workers = QUOTA_WORKERS
+
+    # auto_refresh=False: avoid OIDC fan-out while also hitting billing endpoints
+    accounts = list_live_credentials(include_expired=include_expired, auto_refresh=False)
     # de-dupe by user_id
     seen: set[str] = set()
     unique: list[GrokCredentials] = []
@@ -441,7 +449,7 @@ async def fetch_all_quotas(
     def _fetch_one(creds: GrokCredentials) -> dict[str, Any]:
         return fetch_quota_for_creds(creds)
 
-    workers = min(max_workers, max(1, len(unique)))
+    workers = min(int(max_workers), max(1, len(unique))) if unique else 1
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="quota-") as ex:
         for fut in as_completed(ex.submit(_fetch_one, c) for c in unique):
             try:

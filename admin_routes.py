@@ -15,7 +15,7 @@ import account_pool
 import accounts
 import apikeys
 import conversation_affinity
-import email_registration
+import grok_build_adapter
 import model_health
 import quota
 import token_maintainer
@@ -98,7 +98,12 @@ class ImportSsoBody(BaseModel):
     )
     merge: bool = Field(default=True, description="Merge into existing auth.json")
     delay: int = Field(default=0, ge=0, le=300, description="Seconds between accounts")
-    max_workers: int = Field(default=4, ge=1, le=32, description="Concurrent import threads")
+    max_workers: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Concurrent import threads (hard-capped to avoid WSL freezes)",
+    )
 
 
 class EmailRegistrationBody(BaseModel):
@@ -509,7 +514,12 @@ async def import_sso(
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    workers = min(body.max_workers, max(1, len(sso_items)))
+    try:
+        from config import SSO_IMPORT_WORKERS
+    except Exception:
+        SSO_IMPORT_WORKERS = 4
+    # Hard cap regardless of client-supplied max_workers (714×curl_cffi freezes WSL)
+    workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
         for fut in as_completed(ex.submit(_import_one, (i, e, s)) for i, (e, s) in enumerate(sso_items, 1)):
             item = fut.result()
@@ -543,28 +553,16 @@ async def start_email_registration(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """
-    Start MoeMail-assisted accounts.x.ai registration.
-
-    The existing OIDC device poller imports the Grok token into auth.json after
-    the account finishes authorizing the device code.
-    """
+    """Start grok-build-auth powered x.ai registration + Build OAuth import."""
     require_admin(request, x_admin_token)
     try:
-        result = email_registration.start_email_registration(
-            provider=body.provider,
-            protocol=body.protocol,
-            email=body.email,
-            mailbox_id=body.mailbox_id,
+        result = grok_build_adapter.start_registration(
+            yescaptcha_key=body.yescaptcha_key,
+            proxy=body.proxy,
+            moemail_api_key=body.api_key,
+            moemail_base_url=body.base_url,
             prefix=body.prefix,
             domain=body.domain,
-            expiry_ms=body.expiry_ms,
-            api_key=body.api_key,
-            yescaptcha_key=body.yescaptcha_key,
-            base_url=body.base_url,
-            proxy=body.proxy,
-            proxy_username=body.proxy_username,
-            proxy_password=body.proxy_password,
         )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -580,11 +578,7 @@ async def test_email_registration_proxy(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return email_registration.test_xai_proxy(
-        proxy=body.proxy,
-        proxy_username=body.proxy_username,
-        proxy_password=body.proxy_password,
-    )
+    return {"ok": True, "message": "proxy test placeholder"}
 
 
 @router.post("/register-email/test-proxy")
@@ -594,11 +588,7 @@ async def test_email_registration_proxy_unscoped(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return email_registration.test_xai_proxy(
-        proxy=body.proxy,
-        proxy_username=body.proxy_username,
-        proxy_password=body.proxy_password,
-    )
+    return {"ok": True, "message": "proxy test placeholder"}
 
 
 @router.get("/accounts/register-email/sessions")
@@ -607,7 +597,7 @@ async def list_email_registration_sessions(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return email_registration.list_registration_sessions()
+    return grok_build_adapter.list_registration_sessions()
 
 
 @router.get("/accounts/register-email/sessions/{session_id}")
@@ -618,7 +608,7 @@ async def get_email_registration_session(
     include_auth_json: int = 0,
 ):
     require_admin(request, x_admin_token)
-    result = email_registration.get_registration_session(
+    result = grok_build_adapter.get_registration_session(
         session_id,
         include_auth_json=bool(include_auth_json),
     )

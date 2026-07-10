@@ -21,6 +21,9 @@ from config import (
     DEFAULT_MODEL,
     MODEL_HEALTH_AUTO_DISABLE,
     MODEL_HEALTH_INTERVAL,
+    MODEL_HEALTH_STARTUP_DELAY,
+    MODEL_PROBE_BATCH,
+    MODEL_PROBE_WORKERS,
     PROBE_MODELS,
     UPSTREAM_BASE,
 )
@@ -361,27 +364,59 @@ def probe_single_account(
     }
 
 
+def _unique_live_creds(*, auto_refresh: bool = False) -> list[GrokCredentials]:
+    """De-dupe live credentials. Default auto_refresh=False avoids startup storms."""
+    all_c = list_live_credentials(include_expired=False, auto_refresh=auto_refresh)
+    seen: set[str] = set()
+    out: list[GrokCredentials] = []
+    for c in all_c:
+        uid = c.user_id or c.auth_key or ""
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(c)
+    return out
+
+
 def probe_account_models(
     account_id: str | None = None,
     models: list[str] | None = None,
     *,
     auto_disable: bool | None = None,
     source: str = "manual",
+    max_workers: int | None = None,
+    max_accounts: int | None = None,
 ) -> dict[str, Any]:
-    """Probe one or all accounts for model availability."""
+    """Probe one or all accounts for model availability (concurrency-capped)."""
     models = models or list(PROBE_MODELS) or [DEFAULT_MODEL]
     if account_id:
         creds_list = [load_credentials_by_id(account_id)]
+        deferred = 0
     else:
-        all_c = list_live_credentials(include_expired=False, auto_refresh=True)
-        seen: set[str] = set()
-        creds_list = []
-        for c in all_c:
-            uid = c.user_id or c.auth_key or ""
-            if uid in seen:
-                continue
-            seen.add(uid)
-            creds_list.append(c)
+        # Do NOT auto-refresh all tokens here — token_maintainer owns that path.
+        creds_list = _unique_live_creds(auto_refresh=False)
+        deferred = 0
+        # Background cycles batch; manual all can go larger but still hard-capped
+        if max_accounts is None:
+            max_accounts = (
+                MODEL_PROBE_BATCH if source == "background" else MODEL_PROBE_BATCH * 2
+            )
+        if max_accounts and len(creds_list) > max_accounts:
+            deferred = len(creds_list) - max_accounts
+            # Prefer accounts without a recent successful probe
+            def _probe_age(c: GrokCredentials) -> float:
+                try:
+                    from settings_store import get_account_pool_state
+
+                    meta = (get_account_pool_state().get(c.auth_key or "") or {})
+                    lp = meta.get("last_probe") if isinstance(meta, dict) else None
+                    if isinstance(lp, dict) and lp.get("probed_at"):
+                        return float(lp["probed_at"])
+                except Exception:
+                    pass
+                return 0.0
+
+            creds_list = sorted(creds_list, key=_probe_age)[:max_accounts]
 
     results: list[dict[str, Any]] = []
 
@@ -392,19 +427,23 @@ def probe_account_models(
         )
 
     tasks = [(creds, model) for creds in creds_list for model in models]
-    workers = min(16, max(1, len(tasks)))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-probe-") as ex:
-        for fut in as_completed(ex.submit(_probe_one, t) for t in tasks):
-            try:
-                results.append(fut.result())
-            except Exception as e:  # noqa: BLE001
-                results.append({
-                    "ok": False,
-                    "available": False,
-                    "error": str(e)[:300],
-                    "source": source,
-                    "probed_at": time.time(),
-                })
+    workers = max_workers if max_workers is not None else MODEL_PROBE_WORKERS
+    workers = min(int(workers), max(1, len(tasks))) if tasks else 1
+    if tasks:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="model-probe-"
+        ) as ex:
+            for fut in as_completed(ex.submit(_probe_one, t) for t in tasks):
+                try:
+                    results.append(fut.result())
+                except Exception as e:  # noqa: BLE001
+                    results.append({
+                        "ok": False,
+                        "available": False,
+                        "error": str(e)[:300],
+                        "source": source,
+                        "probed_at": time.time(),
+                    })
 
     available = sum(1 for r in results if r.get("available"))
     blocked = sum(
@@ -418,6 +457,8 @@ def probe_account_models(
         "available_count": available,
         "unavailable_count": len(results) - available,
         "auto_action_count": blocked,
+        "deferred": deferred,
+        "workers": workers,
         "results": results,
         "source": source,
     }
@@ -428,61 +469,21 @@ def probe_all_accounts_concurrent(
     *,
     auto_disable: bool | None = None,
     source: str = "manual",
-    max_workers: int = 16,
+    max_workers: int | None = None,
+    max_accounts: int | None = None,
 ) -> dict[str, Any]:
-    """Probe one model per account concurrently (admin UI "全部模型探测")."""
-    models = models or list(PROBE_MODELS) or [DEFAULT_MODEL]
-    all_c = list_live_credentials(include_expired=False, auto_refresh=True)
-    seen: set[str] = set()
-    creds_list: list[GrokCredentials] = []
-    for c in all_c:
-        uid = c.user_id or c.auth_key or ""
-        if uid in seen:
-            continue
-        seen.add(uid)
-        creds_list.append(c)
-
-    results: list[dict[str, Any]] = []
-
-    def _probe_account(creds: GrokCredentials) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for model in models:
-            out.append(
-                probe_model_for_creds(
-                    creds, model, auto_disable=auto_disable, source=source
-                )
-            )
-        return out
-
-    workers = min(max_workers, max(1, len(creds_list)))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-probe-") as ex:
-        for fut in as_completed(ex.submit(_probe_account, c) for c in creds_list):
-            try:
-                results.extend(fut.result())
-            except Exception as e:  # noqa: BLE001
-                results.append({
-                    "ok": False,
-                    "available": False,
-                    "error": str(e)[:300],
-                    "source": source,
-                    "probed_at": time.time(),
-                })
-
-    available = sum(1 for r in results if r.get("available"))
-    blocked = sum(
-        1 for r in results if not r.get("available") and r.get("auto_disabled")
+    """Probe accounts concurrently (admin UI "全部模型探测") with hard caps."""
+    if max_workers is None:
+        max_workers = MODEL_PROBE_WORKERS
+    # Reuse batched probe_account_models for consistent limits
+    return probe_account_models(
+        None,
+        models,
+        auto_disable=auto_disable,
+        source=source,
+        max_workers=max_workers,
+        max_accounts=max_accounts,
     )
-    return {
-        "ok": True,
-        "probed_at": time.time(),
-        "models": models,
-        "count": len(results),
-        "available_count": available,
-        "unavailable_count": len(results) - available,
-        "auto_action_count": blocked,
-        "results": results,
-        "source": source,
-    }
 
 
 # ── Background periodic checker ─────────────────────────────────────────────
@@ -520,9 +521,17 @@ def request_run_soon() -> None:
     _wakeup.set()
 
 
+def _startup_delay() -> float:
+    try:
+        return max(15.0, float(MODEL_HEALTH_STARTUP_DELAY))
+    except Exception:
+        return 90.0
+
+
 def _worker() -> None:
-    # delay first cycle so startup / token refresh settle
-    if _stop.wait(15.0):
+    # Stagger well after token maintainer so we never double-fan-out on boot
+    # (700 accounts × probe was freezing WSL via thread/network peak).
+    if _stop.wait(_startup_delay()):
         return
     while not _stop.is_set():
         interval = _interval()
@@ -578,6 +587,9 @@ def status() -> dict[str, Any]:
         "enabled": os.getenv("GROK2API_MODEL_HEALTH", "1").lower()
         not in ("0", "false", "no"),
         "interval_sec": interval,
+        "startup_delay_sec": _startup_delay(),
+        "probe_workers": MODEL_PROBE_WORKERS,
+        "probe_batch": MODEL_PROBE_BATCH,
         "probe_models": list(PROBE_MODELS) or [DEFAULT_MODEL],
         "auto_disable": MODEL_HEALTH_AUTO_DISABLE,
         "last": dict(_last_run) if _last_run else None,

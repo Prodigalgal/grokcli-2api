@@ -505,13 +505,19 @@ def main() -> int:
         "--threads",
         type=int,
         default=4,
-        help="并发线程数（默认 4）",
+        help="并发线程数（默认 4，最大 8；大量 SSO 时过高会冻 WSL）",
     )
     args = ap.parse_args()
 
     cookies = load_sso_list(args.sso, args.sso_cookie)
     if not cookies:
         ap.error("需要 --sso 或 --sso-cookie")
+
+    # Hard cap: each worker opens a curl_cffi chrome session; 700× freezes WSL
+    threads = max(1, min(int(args.threads or 4), 8))
+    if threads != args.threads:
+        print(f"⚠️  threads {args.threads} → capped to {threads}")
+    args.threads = threads
 
     if len(cookies) > 1 and not args.out_dir and not args.merge and not args.into_project:
         args.out_dir = args.out_dir or "./auth_out"

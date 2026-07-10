@@ -826,15 +826,14 @@
         <div class="card">
           <div class="card-head">
             <div>
-              <h3>协议注册（MoeMail）</h3>
-              <p>由 grokcli2api 创建设备授权链接，协议发码/验码后自动导入 OIDC 凭证。</p>
+              <h3>协议注册（MoeMail + grok-build-auth）</h3>
+              <p>由 grok-build-auth 协议注册 x.ai 账号，自动完成 Build OAuth 并导入 auth.json。</p>
             </div>
           </div>
           <div class="device-box" id="reg-protocol-box" style="margin-bottom:12px">
             <div class="muted" style="font-size:0.82rem">协议注册</div>
-            <div class="mono" style="margin-top:4px">accounts.x.ai gRPC-web · MoeMail 自动收码 · OIDC 自动导入</div>
+            <div class="mono" style="margin-top:4px">accounts.x.ai · MoeMail 自动收码 · Turnstile · Build OAuth · 自动导入</div>
           </div>
-          <input id="reg-protocol" type="hidden" value="grpc" />
           <div class="row">
             <div>
               <label>MoeMail Base URL</label>
@@ -847,6 +846,10 @@
             <div>
               <label>域名（可选）</label>
               <input id="reg-domain" />
+            </div>
+            <div>
+              <label>有效期（毫秒，可选）</label>
+              <input id="reg-expiry-ms" type="number" min="60000" max="86400000" inputmode="numeric" />
             </div>
             <div>
               <label>MoeMail API Key（可选覆盖）</label>
@@ -867,10 +870,6 @@
             <div>
               <label>代理密码</label>
               <input id="reg-proxy-password" type="password" />
-            </div>
-            <div>
-              <label>线程数</label>
-              <input id="reg-threads" type="number" min="1" max="20" inputmode="numeric" />
             </div>
           </div>
           <div class="actions" style="margin-top:12px">
@@ -1644,55 +1643,44 @@ nohup python3 app.py > grok2api.log 2>&1 &`;
 /* ── Email registration ─────────────────────────────── */
 function readRegConfig() {
   return {
-    protocol: "grpc",
     base_url: $("reg-base-url") ? $("reg-base-url").value.trim() : "",
     prefix: $("reg-prefix") ? $("reg-prefix").value.trim() : "",
     domain: $("reg-domain") ? $("reg-domain").value.trim() : "",
+    expiry_ms: $("reg-expiry-ms") ? $("reg-expiry-ms").value.trim() : "",
     api_key: $("reg-api-key") ? $("reg-api-key").value.trim() : "",
     yescaptcha_key: $("reg-yescaptcha-key") ? $("reg-yescaptcha-key").value.trim() : "",
     proxy: $("reg-proxy") ? $("reg-proxy").value.trim() : "",
     proxy_username: $("reg-proxy-username") ? $("reg-proxy-username").value.trim() : "",
     proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
-    threads: $("reg-threads") ? $("reg-threads").value.trim() : "",
   };
 }
 function applyRegConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
-  if ($("reg-protocol")) $("reg-protocol").value = "grpc";
   if ($("reg-base-url")) $("reg-base-url").value = cfg.base_url || "";
   if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
   if ($("reg-domain")) $("reg-domain").value = cfg.domain || "";
+  if ($("reg-expiry-ms")) $("reg-expiry-ms").value = cfg.expiry_ms || "";
   if ($("reg-api-key")) $("reg-api-key").value = cfg.api_key || "";
   if ($("reg-yescaptcha-key")) $("reg-yescaptcha-key").value = cfg.yescaptcha_key || "";
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
   if ($("reg-proxy-username")) $("reg-proxy-username").value = cfg.proxy_username || "";
   if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
-  if ($("reg-threads")) $("reg-threads").value = cfg.threads || "";
+}
+function saveRegConfig() {
+  localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(readRegConfig()));
+  toast("注册配置已保存");
 }
 function loadRegConfig() {
   try {
     applyRegConfig(JSON.parse(localStorage.getItem(REG_CONFIG_KEY) || "null"));
   } catch (_) {}
 }
-function saveRegConfig() {
-  localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(readRegConfig()));
-  toast("注册配置已保存");
-}
-function getRegThreadCount() {
-  const raw = $("reg-threads") ? $("reg-threads").value.trim() : "";
-  if (!raw) return 1;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n < 1) return 1;
-  return Math.min(n, 20);
-}
-function buildRegBody(config, index) {
-  const body = { provider: "moemail" };
-  if (config.protocol) body.protocol = config.protocol;
+function buildRegBody(config) {
+  const body = {};
   if (config.base_url) body.base_url = config.base_url;
-  if (config.prefix) {
-    body.prefix = index > 1 ? `${config.prefix}-${index}` : config.prefix;
-  }
+  if (config.prefix) body.prefix = config.prefix;
   if (config.domain) body.domain = config.domain;
+  if (config.expiry_ms) body.expiry_ms = Number.parseInt(config.expiry_ms, 10);
   if (config.api_key) body.api_key = config.api_key;
   if (config.yescaptcha_key) body.yescaptcha_key = config.yescaptcha_key;
   if (config.proxy) body.proxy = config.proxy;
@@ -1712,45 +1700,26 @@ function showRegSession(s) {
   regSessionId = s.id || s.session_id || regSessionId;
   if (regSessionId && !regSessionIds.includes(regSessionId)) regSessionIds = [regSessionId];
   $("reg-email").textContent = s.email || s.mailbox_email || "—";
-  const messageCount = (s.latest_messages || []).length;
   const statusBits = [
     s.status || "running",
     s.message || s.error || "",
-    s.protocol ? `协议 ${s.protocol}` : null,
-    s.xai_proxy_enabled ? "代理已启用" : null,
-    s.xai_email_code_sent ? "已发邮箱码" : null,
-    s.xai_email_code_verified ? "已验邮箱码" : null,
-    s.protocol_running ? "后台运行中" : null,
-    s.user_code ? `设备码 ${s.user_code}` : null,
-    s.verification_url ? `验证 ${s.verification_url}` : null,
-    messageCount ? `邮件 ${messageCount} 封` : null,
+    s.sso ? "SSO 已提取" : null,
+    s.oauth ? "OAuth 已完成" : null,
+    s.auth_json_count ? `已导入 ${s.auth_json_count} 账号` : null,
   ].filter(Boolean);
   $("reg-status").textContent = statusBits.join(" · ");
-  const messages = (s.latest_messages || []).map((m, i) => ({
-    index: i + 1,
-    subject: m.subject,
-    from: m.from_address || m.from,
-    codes: m.extracted && m.extracted.codes,
-    links: m.extracted && m.extracted.links,
-  }));
-  $("reg-log").textContent = JSON.stringify({
-    id: regSessionId,
+  const out = {
+    id: s.id || s.session_id,
     email: s.email,
-    mailbox_id: s.mailbox_id,
-    protocol: s.protocol,
-    xai_email_code_sent: s.xai_email_code_sent,
-    xai_email_code_verified: s.xai_email_code_verified,
-    xai_email_code: s.xai_email_code,
-    xai_protocol_result: s.xai_protocol_result,
-    protocol_running: s.protocol_running,
-    protocol_result: s.protocol_result,
-    xai_proxy_enabled: s.xai_proxy_enabled,
-    user_code: s.user_code,
-    verification_url: s.verification_url,
-    account_id: s.account_id,
+    status: s.status,
+    message: s.message,
+    error: s.error,
+    sso: s.sso ? (s.sso.slice(0, 20) + "...") : null,
+    oauth: s.oauth || null,
     auth_json_count: s.auth_json_count,
-    messages,
-  }, null, 2);
+    auth_json: s.auth_json || null,
+  };
+  $("reg-log").textContent = JSON.stringify(out, null, 2);
 }
 function showRegSessionGroup(sessions) {
   $("reg-session-box").classList.remove("hidden");
@@ -1766,15 +1735,9 @@ function showRegSessionGroup(sessions) {
       email: s.email,
       status: s.status,
       message: s.message || s.error,
-      mailbox_id: s.mailbox_id,
-      protocol_running: s.protocol_running,
-      protocol_result: s.protocol_result,
-      user_code: s.user_code,
-      verification_url: s.verification_url,
-      account_id: s.account_id,
-      xai_proxy_enabled: s.xai_proxy_enabled,
-      xai_email_code_sent: s.xai_email_code_sent,
-      xai_email_code_verified: s.xai_email_code_verified,
+      sso: s.sso ? (s.sso.slice(0, 20) + "...") : null,
+      oauth: s.oauth || null,
+      auth_json_count: s.auth_json_count,
     })),
   }, null, 2);
 }
@@ -2237,24 +2200,18 @@ if ($("btn-start-reg")) {
   $("btn-start-reg").onclick = async () => {
     try {
       const config = readRegConfig();
-      const threads = getRegThreadCount();
-      const sessions = [];
       $("btn-start-reg").disabled = true;
-      for (let i = 1; i <= threads; i += 1) {
-        const r = await api("/accounts/register-email", {
-          method: "POST",
-          body: JSON.stringify(buildRegBody(config, i)),
-        });
-        sessions.push(r);
-        if (threads === 1) showRegSession(r);
-        else showRegSessionGroup(sessions);
-      }
-      regSessionIds = sessions.map(s => s.id || s.session_id).filter(Boolean);
-      regSessionId = regSessionIds[0] || null;
+      const r = await api("/accounts/register-email", {
+        method: "POST",
+        body: JSON.stringify(buildRegBody(config)),
+      });
+      regSessionId = r.id || r.session_id || null;
+      regSessionIds = regSessionId ? [regSessionId] : [];
+      showRegSession(r);
       clearInterval(regPollTimer);
       regPollTimer = setInterval(pollRegSession, 3000);
       setTimeout(pollRegSession, 1200);
-      toast(threads > 1 ? `已启动 ${sessions.length} 个注册会话` : (sessions[0]?.email ? ("已启动: " + sessions[0].email) : "已启动邮箱注册"));
+      toast(r.email ? ("已启动: " + r.email) : "已启动邮箱注册");
     } catch (e) {
       toast(e.message, false);
     } finally {

@@ -20,12 +20,19 @@ DEFAULT_ACCOUNT_MODE = "round_robin"
 # Legacy mode name migrated to round_robin
 _LEGACY_MODES = {"primary": "round_robin"}
 
+# In-memory settings cache + deferred dirty flush so probe/refresh of hundreds
+# of accounts doesn't rewrite settings.json on every single account touch.
+_mem: dict[str, Any] | None = None
+_mem_dirty = False
+_flush_timer: threading.Timer | None = None
+_FLUSH_DELAY_SEC = 1.0
+
 
 def _ensure() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load() -> dict[str, Any]:
+def _load_disk() -> dict[str, Any]:
     _ensure()
     if not SETTINGS_FILE.is_file():
         return {}
@@ -36,11 +43,92 @@ def _load() -> dict[str, Any]:
         return {}
 
 
-def _save(data: dict[str, Any]) -> None:
+def _load() -> dict[str, Any]:
+    """Return the live in-memory settings map (lazy-loaded once)."""
+    global _mem
+    with _lock:
+        if _mem is None:
+            _mem = _load_disk()
+        return _mem
+
+
+def _write_disk(data: dict[str, Any]) -> None:
     _ensure()
     tmp = SETTINGS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SETTINGS_FILE)
+
+
+def _schedule_flush_locked() -> None:
+    global _flush_timer, _mem_dirty
+    _mem_dirty = True
+    if _flush_timer is not None:
+        return
+
+    def _flush() -> None:
+        global _flush_timer, _mem_dirty
+        with _lock:
+            _flush_timer = None
+            if not _mem_dirty or _mem is None:
+                _mem_dirty = False
+                return
+            snapshot = json.loads(json.dumps(_mem))  # deep-ish copy via json
+            _mem_dirty = False
+        try:
+            _write_disk(snapshot)
+        except Exception:
+            # re-mark dirty so a later touch retries
+            with _lock:
+                _mem_dirty = True
+                if _flush_timer is None:
+                    _schedule_flush_locked()
+
+    t = threading.Timer(_FLUSH_DELAY_SEC, _flush)
+    t.daemon = True
+    _flush_timer = t
+    t.start()
+
+
+def _save(data: dict[str, Any], *, immediate: bool = False) -> None:
+    """
+    Persist settings. Default is coalesced (1s) to avoid thrashing disk when
+    model probes / quota checks touch hundreds of pool entries.
+    """
+    global _mem
+    with _lock:
+        _mem = data
+        if immediate:
+            # cancel pending timer
+            global _flush_timer, _mem_dirty
+            if _flush_timer is not None:
+                try:
+                    _flush_timer.cancel()
+                except Exception:
+                    pass
+                _flush_timer = None
+            _mem_dirty = False
+            snapshot = json.loads(json.dumps(data))
+            _write_disk(snapshot)
+        else:
+            _schedule_flush_locked()
+
+
+def flush_settings() -> None:
+    """Force any deferred settings writes to disk (call on shutdown if needed)."""
+    global _flush_timer, _mem_dirty
+    with _lock:
+        if _flush_timer is not None:
+            try:
+                _flush_timer.cancel()
+            except Exception:
+                pass
+            _flush_timer = None
+        if _mem is None:
+            _mem_dirty = False
+            return
+        snapshot = json.loads(json.dumps(_mem))
+        _mem_dirty = False
+    _write_disk(snapshot)
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -72,7 +160,7 @@ def set_admin_password(password: str) -> None:
         data["admin_password_hash"] = _hash_password(password, salt)
         data["admin_password_salt"] = salt
         data["updated_at"] = time.time()
-        _save(data)
+        _save(data, immediate=True)
 
 
 def verify_admin_password(password: str) -> bool:
@@ -103,7 +191,7 @@ def create_session_token() -> str:
         }
         sessions[token] = now
         data["sessions"] = sessions
-        _save(data)
+        _save(data, immediate=True)
     return token
 
 
@@ -119,12 +207,12 @@ def verify_session_token(token: str | None) -> bool:
         if time.time() - float(ts) > 7 * 86400:
             sessions.pop(token, None)
             data["sessions"] = sessions
-            _save(data)
+            _save(data, immediate=True)
             return False
-        # sliding refresh
+        # sliding refresh — coalesce to avoid rewrite-per-request
         sessions[token] = time.time()
         data["sessions"] = sessions
-        _save(data)
+        _save(data, immediate=False)
         return True
 
 
@@ -137,7 +225,7 @@ def revoke_session(token: str | None) -> None:
         if token in sessions:
             sessions.pop(token, None)
             data["sessions"] = sessions
-            _save(data)
+            _save(data, immediate=True)
 
 
 def _normalize_mode(mode: str | None) -> str:
@@ -170,14 +258,15 @@ def set_account_mode(mode: str) -> str:
         # Drop legacy preferred-account setting if present
         data.pop("preferred_account_id", None)
         data["updated_at"] = time.time()
-        _save(data)
+        _save(data, immediate=True)
     return mode
 
 
 def get_account_pool_state() -> dict[str, Any]:
     data = _load()
     pool = data.get("account_pool") or {}
-    return pool if isinstance(pool, dict) else {}
+    # Return a shallow copy so callers can mutate without racing the cache
+    return dict(pool) if isinstance(pool, dict) else {}
 
 
 def save_account_pool_state(state: dict[str, Any]) -> None:
@@ -185,7 +274,8 @@ def save_account_pool_state(state: dict[str, Any]) -> None:
         data = _load()
         data["account_pool"] = state
         data["updated_at"] = time.time()
-        _save(data)
+        # Coalesce: model probe / quota may update hundreds of entries
+        _save(data, immediate=False)
 
 
 def touch_account_stats(
@@ -205,6 +295,8 @@ def touch_account_stats(
         meta = pool.get(account_id) or {}
         if not isinstance(meta, dict):
             meta = {}
+        else:
+            meta = dict(meta)
         meta.setdefault("enabled", True)
         meta.setdefault("weight", 1)
         meta["request_count"] = int(meta.get("request_count") or 0) + 1
@@ -222,7 +314,7 @@ def touch_account_stats(
                 meta["cooldown_until"] = float(cooldown_until)
         pool[account_id] = meta
         data["updated_at"] = time.time()
-        _save(data)
+        _save(data, immediate=False)
 
 
 def get_public_settings() -> dict[str, Any]:

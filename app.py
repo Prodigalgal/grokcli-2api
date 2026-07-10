@@ -34,7 +34,6 @@ import anthropic_compat as anth
 import apikeys
 import conversation_affinity
 import token_maintainer
-import web_search_tool
 from admin_routes import router as admin_router
 from auth import AuthError, GrokCredentials, load_credentials, upstream_headers
 from config import (
@@ -52,21 +51,36 @@ APP_VERSION = "1.6.0"
 
 
 def _on_startup() -> None:
-    """Linux-friendly: normalize multi-account keys + start token maintainer."""
+    """Linux-friendly: normalize multi-account keys + start background workers.
+
+    Large pools (hundreds of accounts) must not fan out network + rewrite
+    multi-MB auth.json at process start — that freezes WSL. We only do a
+    cheap normalize here; refresh/probe are staggered + concurrency-capped.
+    """
     try:
         from oidc_auth import normalize_auth_file_keys
+        from auth_store import read_auth_map
 
         r = normalize_auth_file_keys()
+        n_accounts = len(read_auth_map()) if not r.get("total") else int(r.get("total") or 0)
         if r.get("changed"):
             print(
                 f"  multi-account: remounted {r['changed']} auth key(s) "
                 f"→ per-user layout (total={r.get('total')})"
             )
+        else:
+            print(f"  multi-account: {n_accounts} account(s) loaded")
     except Exception as e:  # noqa: BLE001
         print(f"  (auth normalize skipped: {e})")
     try:
         token_maintainer.start_background()
-        print("  token maintainer: background refresh enabled (multi-account)")
+        ts = token_maintainer.status()
+        print(
+            "  token maintainer: enabled "
+            f"(startup_delay={ts.get('startup_delay_sec')}s "
+            f"workers={ts.get('refresh_workers')} "
+            f"batch={ts.get('refresh_batch')})"
+        )
     except Exception as e:  # noqa: BLE001
         print(f"  (token maintainer failed: {e})")
     try:
@@ -76,8 +90,12 @@ def _on_startup() -> None:
         mh = model_health.status()
         if mh.get("enabled") and mh.get("running"):
             print(
-                f"  model health: probe every {mh.get('interval_sec')}s "
-                f"models={mh.get('probe_models')}"
+                "  model health: enabled "
+                f"(startup_delay={mh.get('startup_delay_sec')}s "
+                f"every {mh.get('interval_sec')}s "
+                f"workers={mh.get('probe_workers')} "
+                f"batch={mh.get('probe_batch')} "
+                f"models={mh.get('probe_models')})"
             )
         else:
             print("  model health: disabled or not started")
@@ -304,22 +322,24 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
         "stream": True if FORCE_UPSTREAM_STREAM else bool(req.stream),
     }
 
-    tools, wants_search = web_search_tool.normalize_tools_for_search(req.tools, req.model or "")
+    tools = _normalize_tools(req.tools)
     tool_choice = _normalize_tool_choice(req.tool_choice)
     # If client asks for grok-search model, auto-inject web_search tool
     if req.model and req.model.strip().lower() in ("grok-search", "web-search"):
+        search_tool = {
+            "type": "web_search_preview",
+            "parameters": {"type": "object", "properties": {}},
+        }
         if not tools:
-            tools = [web_search_tool._build_search_function_tool()]
+            tools = [search_tool]
         elif not any(
-            (t.get("type") or "").lower() == "function" and
-            (t.get("function") or {}).get("name") == "web_search"
+            (t.get("type") or "").lower() in ("web_search_preview", "web_search")
             for t in tools
             if isinstance(t, dict)
         ):
-            tools = tools + [web_search_tool._build_search_function_tool()]
+            tools = tools + [search_tool]
         if tool_choice is None:
-            tool_choice = "auto"
-        wants_search = True
+            tool_choice = {"type": "web_search_preview"}
 
     optional = {
         "temperature": req.temperature,
@@ -342,9 +362,200 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     for k, v in optional.items():
         if v is not None:
             body[k] = v
-    if wants_search:
-        body["wants_server_search"] = True
+    # Secondary relays (newapi/sub2api) rely on final stream usage for billing.
+    _ensure_stream_include_usage(body)
     return body
+
+
+def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
+    """Ask upstream for usage on the final SSE chunk when streaming."""
+    if not body.get("stream"):
+        return
+    opts = body.get("stream_options")
+    if not isinstance(opts, dict):
+        opts = {}
+    else:
+        opts = dict(opts)
+    opts["include_usage"] = True
+    body["stream_options"] = opts
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """Rough token estimate (~4 chars / token). Enough for relay billing fallback."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _messages_prompt_estimate(messages: Any) -> int:
+    total = 0
+    if not isinstance(messages, list):
+        return 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            total += _estimate_text_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if isinstance(part.get("text"), str):
+                        total += _estimate_text_tokens(part["text"])
+                    elif part.get("type") == "image_url":
+                        total += 85
+                elif isinstance(part, str):
+                    total += _estimate_text_tokens(part)
+        if m.get("name"):
+            total += _estimate_text_tokens(str(m["name"]))
+        if isinstance(m.get("tool_calls"), list):
+            for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                total += _estimate_text_tokens(str(fn.get("name") or ""))
+                total += _estimate_text_tokens(str(fn.get("arguments") or ""))
+        if m.get("tool_call_id"):
+            total += 4
+    return total
+
+
+def _completion_tokens_estimate(
+    content: str = "",
+    reasoning: str = "",
+    tool_calls: list[Any] | None = None,
+) -> int:
+    total = _estimate_text_tokens(content) + _estimate_text_tokens(reasoning)
+    if tool_calls:
+        try:
+            total += _estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False))
+        except (TypeError, ValueError):
+            total += _estimate_text_tokens(str(tool_calls))
+    return total
+
+
+def _normalize_usage(
+    usage: dict[str, Any] | None,
+    *,
+    prompt_fallback: int = 0,
+    completion_fallback: int = 0,
+) -> dict[str, int]:
+    """Normalize OpenAI-style usage; fill missing fields for secondary relays."""
+    prompt = 0
+    completion = 0
+    if isinstance(usage, dict):
+        try:
+            prompt = int(
+                usage.get("prompt_tokens")
+                or usage.get("input_tokens")
+                or 0
+            )
+        except (TypeError, ValueError):
+            prompt = 0
+        try:
+            completion = int(
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or 0
+            )
+        except (TypeError, ValueError):
+            completion = 0
+        if not prompt and not completion:
+            # Some upstreams only send total_tokens
+            try:
+                total_only = int(usage.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                total_only = 0
+            if total_only > 0 and completion_fallback >= 0:
+                # Prefer splitting with fallbacks when available
+                if completion_fallback and completion_fallback < total_only:
+                    completion = completion_fallback
+                    prompt = max(0, total_only - completion)
+                elif prompt_fallback and prompt_fallback < total_only:
+                    prompt = prompt_fallback
+                    completion = max(0, total_only - prompt)
+                else:
+                    prompt = total_only
+    if prompt <= 0 and prompt_fallback > 0:
+        prompt = prompt_fallback
+    if completion <= 0 and completion_fallback > 0:
+        completion = completion_fallback
+    total = prompt + completion
+    if isinstance(usage, dict):
+        try:
+            reported_total = int(usage.get("total_tokens") or 0)
+        except (TypeError, ValueError):
+            reported_total = 0
+        if reported_total > total:
+            total = reported_total
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+    }
+
+
+def _usage_from_body_and_output(
+    body: dict[str, Any],
+    *,
+    content: str = "",
+    reasoning: str = "",
+    tool_calls: list[Any] | None = None,
+    usage: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    prompt_fb = _messages_prompt_estimate(body.get("messages"))
+    # tools schema also consumes prompt tokens roughly
+    if body.get("tools"):
+        try:
+            prompt_fb += _estimate_text_tokens(
+                json.dumps(body.get("tools"), ensure_ascii=False)
+            )
+        except (TypeError, ValueError):
+            pass
+    completion_fb = _completion_tokens_estimate(content, reasoning, tool_calls)
+    return _normalize_usage(
+        usage, prompt_fallback=prompt_fb, completion_fallback=completion_fb
+    )
+
+
+async def _aiter_sse_lines_with_keepalive(
+    resp: httpx.Response,
+    *,
+    keepalive_interval: float = 15.0,
+) -> AsyncIterator[str | None]:
+    """
+    Yield SSE lines from upstream; yield None on keepalive ticks.
+
+    Secondary relays (newapi etc.) often idle-timeout long thinking gaps.
+    None means the caller should emit an SSE comment / ping.
+    """
+    aiter = resp.aiter_lines()
+    pending: asyncio.Future[str] | None = asyncio.ensure_future(aiter.__anext__())
+    try:
+        while pending is not None:
+            try:
+                line = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=keepalive_interval
+                )
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            except StopAsyncIteration:
+                break
+            except RuntimeError as e:
+                # CPython may wrap StopAsyncIteration from __anext__ as RuntimeError
+                if "StopAsyncIteration" in str(e):
+                    break
+                raise
+            yield line
+            pending = asyncio.ensure_future(aiter.__anext__())
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
 
 
 def openai_error(
@@ -372,31 +583,43 @@ def _sse_chunk(
     finish_reason: str | None = None,
     reasoning: str | None = None,
     tool_calls: list[Any] | None = None,
+    usage: dict[str, Any] | None = None,
+    include_choices: bool = True,
 ) -> str:
-    delta: dict[str, Any] = {}
-    if role is not None:
-        delta["role"] = role
-    if content is not None:
-        delta["content"] = content
-    if reasoning is not None:
-        delta["reasoning_content"] = reasoning
-    if tool_calls is not None:
-        delta["tool_calls"] = tool_calls
-
-    payload = {
+    payload: dict[str, Any] = {
         "id": chat_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [
+    }
+    if include_choices:
+        delta: dict[str, Any] = {}
+        if role is not None:
+            delta["role"] = role
+        if content is not None:
+            delta["content"] = content
+        if reasoning is not None:
+            delta["reasoning_content"] = reasoning
+        if tool_calls is not None:
+            delta["tool_calls"] = tool_calls
+        payload["choices"] = [
             {
                 "index": 0,
                 "delta": delta,
                 "finish_reason": finish_reason,
             }
-        ],
-    }
+        ]
+    else:
+        # OpenAI final usage-only chunk uses empty choices
+        payload["choices"] = []
+    if usage is not None:
+        payload["usage"] = usage
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _sse_keepalive() -> str:
+    """SSE comment keepalive for idle gaps (newapi/nginx proxies)."""
+    return ": keepalive\n\n"
 
 
 def _parse_sse_line(line: str) -> dict[str, Any] | None | Literal["[DONE]"]:
@@ -677,39 +900,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    wants_search = bool(body.get("wants_server_search"))
-    if "wants_server_search" in body:
-        del body["wants_server_search"]
-
     if req.stream:
-        if wants_search:
-            return StreamingResponse(
-                _stream_search_agent(
-                    url=url,
-                    body=body,
-                    chain=chain,
-                    chat_id=chat_id,
-                    model=model,
-                    created=created,
-                    client_disconnected=request.is_disconnected,
-                    conversation_fp=conv_fp,
-                    original_messages=[_message_to_upstream(m) for m in req.messages],
-                ),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "X-Grok2API-Accounts": str(len(chain)),
-                    "X-Grok2API-Affinity": "1" if prefer_account else "0",
-                    "X-Grok2API-Search": "1",
-                    **(
-                        {"X-Grok2API-Conversation-Fp": conv_fp}
-                        if conv_fp
-                        else {}
-                    ),
-                },
-            )
         return StreamingResponse(
             _stream_proxy_with_failover(
                 url=url,
@@ -734,19 +925,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     else {}
                 ),
             },
-        )
-
-    if wants_search:
-        return await _non_stream_search_agent(
-            url=url,
-            body=body,
-            chain=chain,
-            chat_id=chat_id,
-            model=model,
-            created=created,
-            conversation_fp=conv_fp,
-            prefer_account=prefer_account,
-            original_messages=[_message_to_upstream(m) for m in req.messages],
         )
 
     last_error: str | None = None
@@ -793,8 +971,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     }
                 ],
             }
-            if usage:
-                result["usage"] = usage
+            result["usage"] = _usage_from_body_and_output(
+                body,
+                content=content or "",
+                reasoning=reasoning or "",
+                tool_calls=tool_calls,
+                usage=usage,
+            )
             # non-standard but useful for multi-account debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
@@ -838,16 +1021,21 @@ async def _stream_proxy_with_failover(
     client_disconnected,
     conversation_fp: str | None = None,
 ) -> AsyncIterator[str]:
-    yield _sse_chunk(
-        chat_id=chat_id, model=model, created=created, role="assistant", content=""
-    )
-
+    # Do NOT emit a premature role chunk before upstream accepts — secondary
+    # relays treat early chunks as stream-started and cannot safely failover.
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
+    role_sent = False
+
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
         finished = False
         saw_tool_calls = False
+        stream_started = False  # True once any content has been sent to client
+        usage: dict[str, Any] | None = None
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_acc: dict[int, dict[str, Any]] = {}
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(TIMEOUT, connect=30.0)
@@ -892,17 +1080,34 @@ async def _stream_proxy_with_failover(
                             conversation_affinity.bind_affinity(
                                 conversation_fp, creds.auth_key
                             )
+
+                    if not role_sent:
+                        yield _sse_chunk(
+                            chat_id=chat_id,
+                            model=model,
+                            created=created,
+                            role="assistant",
+                            content="",
+                        )
+                        role_sent = True
+
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if "text/event-stream" in ctype or "stream" in ctype:
-                        async for line in resp.aiter_lines():
+                        async for line in _aiter_sse_lines_with_keepalive(resp):
                             if await client_disconnected():
                                 return
+                            if line is None:
+                                # idle keepalive for newapi / reverse proxies
+                                yield _sse_keepalive()
+                                continue
                             parsed = _parse_sse_line(line)
                             if parsed is None:
                                 continue
                             if parsed == "[DONE]":
                                 break
                             assert isinstance(parsed, dict)
+                            if isinstance(parsed.get("usage"), dict):
+                                usage = parsed["usage"]
                             content, reasoning, tool_calls = _extract_delta_parts(
                                 parsed
                             )
@@ -910,9 +1115,25 @@ async def _stream_proxy_with_failover(
                             choices = parsed.get("choices")
                             if isinstance(choices, list) and choices:
                                 finish = choices[0].get("finish_reason")
+                            # usage-only final chunk (choices empty / null)
+                            if (
+                                not content
+                                and not reasoning
+                                and not tool_calls
+                                and not finish
+                                and isinstance(parsed.get("usage"), dict)
+                            ):
+                                usage = parsed["usage"]
+                                continue
+                            if content:
+                                content_parts.append(content)
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
                             if tool_calls:
                                 saw_tool_calls = True
+                                _merge_tool_call_delta(tool_acc, tool_calls)
                             if content or reasoning or tool_calls or finish:
+                                stream_started = True
                                 if finish:
                                     finished = True
                                 yield _sse_chunk(
@@ -930,6 +1151,8 @@ async def _stream_proxy_with_failover(
                             data = json.loads(raw)
                         except json.JSONDecodeError:
                             text = raw.decode("utf-8", errors="replace")
+                            content_parts.append(text)
+                            stream_started = True
                             yield _sse_chunk(
                                 chat_id=chat_id,
                                 model=model,
@@ -939,6 +1162,8 @@ async def _stream_proxy_with_failover(
                             )
                             finished = True
                         else:
+                            if isinstance(data.get("usage"), dict):
+                                usage = data["usage"]
                             content, reasoning, tool_calls = _extract_delta_parts(data)
                             msg_tool_calls: list[Any] | None = None
                             finish_reason = "stop"
@@ -975,6 +1200,13 @@ async def _stream_proxy_with_failover(
                                 saw_tool_calls = True
                                 if finish_reason in (None, "stop"):
                                     finish_reason = "tool_calls"
+                                if isinstance(emit_tc, list):
+                                    _merge_tool_call_delta(tool_acc, emit_tc)
+                            if content:
+                                content_parts.append(content)
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
+                            stream_started = True
                             if content:
                                 yield _sse_chunk(
                                     chat_id=chat_id,
@@ -1013,6 +1245,7 @@ async def _stream_proxy_with_failover(
                             )
                             finished = True
 
+            final_tc = _finalize_tool_calls(tool_acc)
             if not finished:
                 yield _sse_chunk(
                     chat_id=chat_id,
@@ -1020,6 +1253,21 @@ async def _stream_proxy_with_failover(
                     created=created,
                     finish_reason="tool_calls" if saw_tool_calls else "stop",
                 )
+            # OpenAI-compatible final usage chunk (empty choices) for sub2api/newapi
+            norm_usage = _usage_from_body_and_output(
+                body,
+                content="".join(content_parts),
+                reasoning="".join(reasoning_parts),
+                tool_calls=final_tc,
+                usage=usage,
+            )
+            yield _sse_chunk(
+                chat_id=chat_id,
+                model=model,
+                created=created,
+                usage=norm_usage,
+                include_choices=False,
+            )
             yield "data: [DONE]\n\n"
             return
         except asyncio.CancelledError:
@@ -1027,6 +1275,20 @@ async def _stream_proxy_with_failover(
         except Exception as e:  # noqa: BLE001
             account_pool.report_failure(creds.auth_key, error=str(e), status_code=502)
             last_err = str(e)
+            # Never failover after bytes were already streamed to the client —
+            # secondary relays treat that as a mid-stream corruption / break.
+            if stream_started or role_sent:
+                err_payload = {
+                    "id": chat_id,
+                    "object": "error",
+                    "error": {
+                        "message": last_err,
+                        "type": "proxy_error",
+                    },
+                }
+                yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
             if idx < len(chain) - 1:
                 continue
             err_payload = {
@@ -1059,7 +1321,7 @@ async def _collect_completion(
     dict[str, Any] | None,
     list[dict[str, Any]] | None,
 ]:
-    """Consume upstream (usually SSE) and return full text + tool_calls."""
+    """Consume upstream (usually SSE) and return full text + tool_calls + usage."""
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     finish: str | None = None
@@ -1067,8 +1329,12 @@ async def _collect_completion(
     tool_acc: dict[int, dict[str, Any]] = {}
     complete_tool_calls: list[dict[str, Any]] | None = None
 
+    # Ensure stream usage is requested when we force-stream for non-stream clients
+    req_body = dict(body)
+    _ensure_stream_include_usage(req_body)
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as resp:
+        async with client.stream("POST", url, headers=headers, json=req_body) as resp:
             if resp.status_code >= 400:
                 raw = await resp.aread()
                 # attach body text onto response for callers
@@ -1140,248 +1406,23 @@ async def _collect_completion(
     tool_calls = complete_tool_calls or _finalize_tool_calls(tool_acc)
     if tool_calls and (not finish or finish == "stop"):
         finish = "tool_calls"
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    # Always normalize so secondary relays never see missing/zero usage
+    usage = _usage_from_body_and_output(
+        req_body,
+        content=content,
+        reasoning=reasoning,
+        tool_calls=tool_calls,
+        usage=usage,
+    )
     return (
-        "".join(content_parts),
-        "".join(reasoning_parts),
+        content,
+        reasoning,
         finish,
         usage,
         tool_calls,
     )
-
-
-async def _non_stream_search_agent(
-    *,
-    url: str,
-    body: dict[str, Any],
-    chain: list[GrokCredentials],
-    chat_id: str,
-    model: str,
-    created: int,
-    conversation_fp: str | None,
-    prefer_account: bool,
-    original_messages: list[dict[str, Any]],
-) -> JSONResponse:
-    """Non-stream OpenAI search: run assistant, execute search, run final."""
-    first_tried = chain[0].auth_key if chain else None
-    assistant_message: dict[str, Any] | None = None
-    tool_calls: list[dict[str, Any]] = []
-
-    # Round 1: get tool_calls
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        round_body = {**body, "messages": original_messages}
-        try:
-            content, reasoning, finish, usage, tcs = await _collect_completion(
-                url=url, headers=headers, body=round_body
-            )
-            account_pool.report_success(creds.auth_key)
-            if conversation_fp:
-                if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conversation_fp, first_tried, creds.auth_key
-                    )
-                else:
-                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
-            if tcs:
-                tool_calls = tcs
-                assistant_message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": tcs,
-                }
-                if reasoning:
-                    assistant_message["reasoning_content"] = reasoning
-                break
-            # No tool calls needed; return directly
-            message = {"role": "assistant", "content": content or ""}
-            if reasoning:
-                message["reasoning_content"] = reasoning
-            result: dict[str, Any] = {
-                "id": chat_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
-            }
-            if usage:
-                result["usage"] = usage
-            result["x_grok2api_account"] = creds.email or creds.auth_key
-            result["x_grok2api_affinity"] = bool(prefer_account)
-            if conversation_fp:
-                result["x_grok2api_conversation_fp"] = conversation_fp
-            return JSONResponse(content=result)
-        except Exception:
-            continue
-
-    if not assistant_message or not tool_calls:
-        return openai_error("Search agent failed to get tool_calls", status=502)
-
-    search_results = await web_search_tool.execute_search_tool_calls(tool_calls)
-    if not search_results:
-        return openai_error("Search execution failed", status=502)
-
-    # Round 2: feed results back
-    messages = original_messages
-    for tc in tool_calls:
-        tcid = tc.get("id") or ""
-        result_text = search_results.get(tcid) or "未找到搜索结果"
-        messages = web_search_tool.openai_messages_with_tool_result(
-            messages, assistant_message, tcid, result_text
-        )
-
-    final_body = {**body, "messages": messages}
-    last_error = "All accounts failed in search final step"
-    last_status = 502
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        try:
-            content, reasoning, finish, usage, _ = await _collect_completion(
-                url=url, headers=headers, body=final_body
-            )
-            account_pool.report_success(creds.auth_key)
-            message = {"role": "assistant", "content": content or ""}
-            if reasoning:
-                message["reasoning_content"] = reasoning
-            result = {
-                "id": chat_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
-            }
-            if usage:
-                result["usage"] = usage
-            result["x_grok2api_account"] = creds.email or creds.auth_key
-            result["x_grok2api_affinity"] = bool(prefer_account)
-            if conversation_fp:
-                result["x_grok2api_conversation_fp"] = conversation_fp
-            return JSONResponse(content=result)
-        except httpx.HTTPStatusError as e:
-            code = e.response.status_code if e.response is not None else 502
-            last_error = e.response.text[:500] if e.response is not None else str(e)
-            last_status = code
-            if not _retryable_status(code):
-                break
-            continue
-        except Exception as e:
-            last_error = str(e)
-            last_status = 502
-            continue
-
-    return openai_error(last_error, status=last_status)
-
-
-async def _stream_search_agent(
-    *,
-    url: str,
-    body: dict[str, Any],
-    chain: list[GrokCredentials],
-    chat_id: str,
-    model: str,
-    created: int,
-    client_disconnected,
-    conversation_fp: str | None,
-    original_messages: list[dict[str, Any]],
-) -> AsyncIterator[str]:
-    """Stream OpenAI search: emit reasoning/content from first call, run search, then stream final."""
-    yield _sse_chunk(chat_id=chat_id, model=model, created=created, role="assistant", content="")
-
-    first_tried = chain[0].auth_key if chain else None
-    assistant_message: dict[str, Any] | None = None
-    tool_calls: list[dict[str, Any]] = []
-    used_creds: GrokCredentials | None = None
-
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        round_body = {**body, "messages": original_messages}
-        try:
-            content, reasoning, finish, usage, tcs = await _collect_completion(
-                url=url, headers=headers, body=round_body
-            )
-            account_pool.report_success(creds.auth_key)
-            used_creds = creds
-            if conversation_fp:
-                if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conversation_fp, first_tried, creds.auth_key
-                    )
-                else:
-                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
-            if tcs:
-                tool_calls = tcs
-                assistant_message = {"role": "assistant", "content": content or None, "tool_calls": tcs}
-                if reasoning:
-                    assistant_message["reasoning_content"] = reasoning
-            else:
-                if content:
-                    yield _sse_chunk(chat_id=chat_id, model=model, created=created, content=content)
-                if reasoning:
-                    yield _sse_chunk(chat_id=chat_id, model=model, created=created, reasoning=reasoning)
-                yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason=finish or "stop")
-                yield "data: [DONE]\n\n"
-            break
-        except Exception:
-            continue
-
-    if not assistant_message or not tool_calls:
-        yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': 'Search agent failed to get tool_calls', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-
-    # Emit tool_calls delta and finish=tool_calls before executing search
-    for tc in tool_calls:
-        yield _sse_chunk(chat_id=chat_id, model=model, created=created, tool_calls=[tc])
-    yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason="tool_calls")
-
-    search_results = await web_search_tool.execute_search_tool_calls(tool_calls)
-
-    messages = original_messages
-    for tc in tool_calls:
-        tcid = tc.get("id") or ""
-        result_text = search_results.get(tcid) or "未找到搜索结果"
-        messages = web_search_tool.openai_messages_with_tool_result(
-            messages, assistant_message, tcid, result_text
-        )
-
-    final_body = {**body, "messages": messages}
-    for idx, creds in enumerate(chain):
-        headers = upstream_headers(creds.token, model)
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
-                async with client.stream("POST", url, headers=headers, json=final_body) as resp:
-                    if resp.status_code >= 400:
-                        err_text = (await resp.aread()).decode("utf-8", errors="replace")[:500]
-                        if _retryable_status(resp.status_code) and idx < len(chain) - 1:
-                            continue
-                        yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': f'Upstream {resp.status_code}: {err_text}', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    async for line in resp.aiter_lines():
-                        if await client_disconnected():
-                            return
-                        parsed = _parse_sse_line(line)
-                        if parsed is None or parsed == "[DONE]":
-                            continue
-                        c, r, tc_delta = _extract_delta_parts(parsed)
-                        if c:
-                            yield _sse_chunk(chat_id=chat_id, model=model, created=created, content=c)
-                        if r:
-                            yield _sse_chunk(chat_id=chat_id, model=model, created=created, reasoning=r)
-                        choices = parsed.get("choices") or []
-                        if choices:
-                            fr = choices[0].get("finish_reason")
-                            if fr:
-                                yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason=fr)
-            yield "data: [DONE]\n\n"
-            return
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            if idx < len(chain) - 1:
-                continue
-            yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': 'Search final step failed', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
 
 
 # ── Anthropic Messages API ──────────────────────────────────────────────────
@@ -1459,44 +1500,16 @@ async def anthropic_messages(
             str(e), status=401, err_type="authentication_error"
         )
 
-    body, wants_search = anth.build_openai_chat_body(
+    body = anth.build_openai_chat_body(
         req, model, force_stream=FORCE_UPSTREAM_STREAM
     )
     # Always stream upstream when forced; client may still want non-stream response
     if FORCE_UPSTREAM_STREAM:
         body["stream"] = True
+    _ensure_stream_include_usage(body)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
     if req.stream:
-        if wants_search:
-            return StreamingResponse(
-                _stream_anthropic_search_agent(
-                    url=url,
-                    body=body,
-                    chain=chain,
-                    message_id=message_id,
-                    model=model,
-                    client_disconnected=request.is_disconnected,
-                    conversation_fp=conv_fp,
-                    prefer_account=prefer_account,
-                    original_messages=anth.anthropic_messages_to_openai(req.messages, system=req.system),
-                ),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "X-Grok2API-Protocol": "anthropic",
-                    "X-Grok2API-Accounts": str(len(chain)),
-                    "X-Grok2API-Affinity": "1" if prefer_account else "0",
-                    "X-Grok2API-Search": "1",
-                    **(
-                        {"X-Grok2API-Conversation-Fp": conv_fp}
-                        if conv_fp
-                        else {}
-                    ),
-                },
-            )
         return StreamingResponse(
             _stream_anthropic_with_failover(
                 url=url,
@@ -1521,18 +1534,6 @@ async def anthropic_messages(
                     else {}
                 ),
             },
-        )
-
-    if wants_search:
-        return await _non_stream_anthropic_search_agent(
-            url=url,
-            body=body,
-            chain=chain,
-            message_id=message_id,
-            model=model,
-            conversation_fp=conv_fp,
-            prefer_account=prefer_account,
-            original_messages=anth.anthropic_messages_to_openai(req.messages, system=req.system),
         )
 
     last_error: str | None = None
@@ -1621,6 +1622,15 @@ async def _stream_anthropic_with_failover(
     """Upstream OpenAI SSE → Anthropic Messages SSE with account failover."""
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
+    # Estimate prompt tokens for message_start (sub2api reads this early)
+    prompt_est = _messages_prompt_estimate(body.get("messages"))
+    if body.get("tools"):
+        try:
+            prompt_est += _estimate_text_tokens(
+                json.dumps(body.get("tools"), ensure_ascii=False)
+            )
+        except (TypeError, ValueError):
+            pass
 
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
@@ -1628,6 +1638,9 @@ async def _stream_anthropic_with_failover(
             message_id=message_id, model=model
         )
         finished = False
+        stream_started = False
+        usage: dict[str, Any] | None = None
+        held_finish: str | None = None
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(TIMEOUT, connect=30.0)
@@ -1666,21 +1679,27 @@ async def _stream_anthropic_with_failover(
                                 conversation_fp, creds.auth_key
                             )
 
-                    # message_start first
-                    for ev in assembler.start():
+                    # message_start first — only after upstream accepted
+                    for ev in assembler.start(input_tokens=prompt_est):
                         yield ev
+                    stream_started = True
 
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if "text/event-stream" in ctype or "stream" in ctype:
-                        async for line in resp.aiter_lines():
+                        async for line in _aiter_sse_lines_with_keepalive(resp):
                             if await client_disconnected():
                                 return
+                            if line is None:
+                                yield anth.anthropic_stream_ping()
+                                continue
                             parsed = _parse_sse_line(line)
                             if parsed is None:
                                 continue
                             if parsed == "[DONE]":
                                 break
                             assert isinstance(parsed, dict)
+                            if isinstance(parsed.get("usage"), dict):
+                                usage = parsed["usage"]
                             content, reasoning, tool_calls = _extract_delta_parts(
                                 parsed
                             )
@@ -1688,6 +1707,16 @@ async def _stream_anthropic_with_failover(
                             choices = parsed.get("choices")
                             if isinstance(choices, list) and choices:
                                 finish = choices[0].get("finish_reason")
+                            # usage-only final OpenAI chunk
+                            if (
+                                not content
+                                and not reasoning
+                                and not tool_calls
+                                and not finish
+                                and isinstance(parsed.get("usage"), dict)
+                            ):
+                                usage = parsed["usage"]
+                                continue
                             if content or reasoning or tool_calls:
                                 for ev in assembler.feed(
                                     content=content or None,
@@ -1696,10 +1725,19 @@ async def _stream_anthropic_with_failover(
                                 ):
                                     yield ev
                             if finish:
+                                # Capture finish but keep reading — usage often
+                                # arrives on a subsequent empty-choices chunk.
                                 finished = True
-                                for ev in assembler.finish(finish):
-                                    yield ev
-                                return
+                                held_finish = finish
+                        # Drain complete: now emit terminal events with best usage
+                        fr = held_finish or (
+                            "tool_calls" if assembler._saw_tool else "stop"
+                        )
+                        for ev in assembler.finish(
+                            fr, usage=usage, input_tokens=prompt_est
+                        ):
+                            yield ev
+                        return
                     else:
                         raw = await resp.aread()
                         try:
@@ -1708,10 +1746,14 @@ async def _stream_anthropic_with_failover(
                             text = raw.decode("utf-8", errors="replace")
                             for ev in assembler.feed(content=text):
                                 yield ev
-                            for ev in assembler.finish("stop"):
+                            for ev in assembler.finish(
+                                "stop", usage=usage, input_tokens=prompt_est
+                            ):
                                 yield ev
                             return
                         else:
+                            if isinstance(data.get("usage"), dict):
+                                usage = data["usage"]
                             content, reasoning, tool_calls = _extract_delta_parts(
                                 data
                             )
@@ -1738,13 +1780,19 @@ async def _stream_anthropic_with_failover(
                                     tool_calls=tool_calls,
                                 ):
                                     yield ev
-                            for ev in assembler.finish(finish_reason):
+                            for ev in assembler.finish(
+                                finish_reason,
+                                usage=usage,
+                                input_tokens=prompt_est,
+                            ):
                                 yield ev
                             return
 
             if not finished:
                 for ev in assembler.finish(
-                    "tool_calls" if assembler._saw_tool else "stop"
+                    "tool_calls" if assembler._saw_tool else "stop",
+                    usage=usage,
+                    input_tokens=prompt_est,
                 ):
                     yield ev
             return
@@ -1755,6 +1803,12 @@ async def _stream_anthropic_with_failover(
                 creds.auth_key, error=str(e), status_code=502
             )
             last_err = str(e)
+            # Mid-stream failures cannot safely failover for secondary relays
+            if stream_started:
+                yield anth.anthropic_stream_error(
+                    last_err or "proxy_error", err_type="api_error"
+                )
+                return
             if idx < len(chain) - 1:
                 continue
             yield anth.anthropic_stream_error(
@@ -1765,257 +1819,6 @@ async def _stream_anthropic_with_failover(
     yield anth.anthropic_stream_error(
         last_err or "All accounts failed", err_type="api_error"
     )
-
-
-async def _non_stream_anthropic_search_agent(
-    *,
-    url: str,
-    body: dict[str, Any],
-    chain: list[GrokCredentials],
-    message_id: str,
-    model: str,
-    conversation_fp: str | None,
-    prefer_account: bool,
-    original_messages: list[dict[str, Any]],
-) -> JSONResponse:
-    """Non-stream Anthropic search: get tool_use, run search, return final message."""
-    first_tried = chain[0].auth_key if chain else None
-    assistant_message: dict[str, Any] | None = None
-    tool_uses: list[dict[str, Any]] = []
-
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        round_body = {**body, "messages": original_messages}
-        try:
-            content, reasoning, finish, usage, tool_calls = await _collect_completion(
-                url=url, headers=headers, body=round_body
-            )
-            account_pool.report_success(creds.auth_key)
-            if conversation_fp:
-                if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conversation_fp, first_tried, creds.auth_key
-                    )
-                else:
-                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
-            if tool_calls:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": tool_calls,
-                    "reasoning_content": reasoning or None,
-                }
-                tool_uses = anth.openai_tool_calls_to_content_blocks(tool_calls)
-                break
-            return JSONResponse(
-                content=anth.openai_completion_to_anthropic(
-                    content=content or "",
-                    reasoning=reasoning or "",
-                    finish=finish,
-                    usage=usage,
-                    model=model,
-                    message_id=message_id,
-                )
-            )
-        except Exception:
-            continue
-
-    if not assistant_message or not tool_uses:
-        return _anthropic_error_response("Search agent failed to get tool_use", status=502)
-
-    openai_tool_calls = web_search_tool.anthropic_tool_use_to_openai(tool_uses)
-    search_results = await web_search_tool.execute_search_tool_calls(openai_tool_calls)
-
-    messages = original_messages
-    for tu in tool_uses:
-        tuid = tu.get("id") or ""
-        result_text = search_results.get(tuid) or "未找到搜索结果"
-        messages = web_search_tool.anthropic_messages_with_tool_result(
-            messages, assistant_message, tuid, result_text
-        )
-
-    final_body = {**body, "messages": messages}
-    last_error = "All accounts failed in search final step"
-    last_status = 502
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        try:
-            content, reasoning, finish, usage, _ = await _collect_completion(
-                url=url, headers=headers, body=final_body
-            )
-            account_pool.report_success(creds.auth_key)
-            result = anth.openai_completion_to_anthropic(
-                content=content or "",
-                reasoning=reasoning or "",
-                finish=finish,
-                usage=usage,
-                model=model,
-                message_id=message_id,
-            )
-            result["x_grok2api_account"] = creds.email or creds.auth_key
-            result["x_grok2api_affinity"] = bool(prefer_account)
-            if conversation_fp:
-                result["x_grok2api_conversation_fp"] = conversation_fp
-            return JSONResponse(content=result)
-        except httpx.HTTPStatusError as e:
-            code = e.response.status_code if e.response is not None else 502
-            last_error = e.response.text[:500] if e.response is not None else str(e)
-            last_status = code
-            if not _retryable_status(code):
-                break
-            continue
-        except Exception as e:
-            last_error = str(e)
-            last_status = 502
-            continue
-
-    return _anthropic_error_response(last_error, status=last_status)
-
-
-async def _stream_anthropic_search_agent(
-    *,
-    url: str,
-    body: dict[str, Any],
-    chain: list[GrokCredentials],
-    message_id: str,
-    model: str,
-    client_disconnected,
-    conversation_fp: str | None,
-    prefer_account: bool,
-    original_messages: list[dict[str, Any]],
-) -> AsyncIterator[str]:
-    """Stream Anthropic search: emit tool_use, run search, stream final answer."""
-    first_tried = chain[0].auth_key if chain else None
-    assistant_message: dict[str, Any] | None = None
-    tool_uses: list[dict[str, Any]] = []
-
-    for creds in chain:
-        headers = upstream_headers(creds.token, model)
-        round_body = {**body, "messages": original_messages}
-        try:
-            content, reasoning, finish, usage, tool_calls = await _collect_completion(
-                url=url, headers=headers, body=round_body
-            )
-            account_pool.report_success(creds.auth_key)
-            if conversation_fp:
-                if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conversation_fp, first_tried, creds.auth_key
-                    )
-                else:
-                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
-            if tool_calls:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": tool_calls,
-                    "reasoning_content": reasoning or None,
-                }
-                tool_uses = anth.openai_tool_calls_to_content_blocks(tool_calls)
-            break
-        except Exception:
-            continue
-
-    if not assistant_message or not tool_uses:
-        yield anth.anthropic_stream_error("Search agent failed to get tool_use", err_type="api_error")
-        return
-
-    # Emit message_start + tool_use blocks + stop_reason=tool_use
-    yield anth.anthropic_stream_message_start(message_id=message_id, model=model)
-    yield anth.anthropic_stream_block_start_text(0)
-    if assistant_message.get("reasoning_content"):
-        # Anthropic spec: thinking is its own block before text; simplify by putting reasoning into text
-        pass
-    if assistant_message.get("content"):
-        yield anth.anthropic_stream_text_delta(0, assistant_message["content"])
-    yield anth.anthropic_stream_block_stop(0)
-    idx = 1
-    for tu in tool_uses:
-        yield anth.anthropic_stream_block_start_tool(
-            idx,
-            tool_id=tu.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
-            name=tu.get("name") or "web_search",
-        )
-        inp = tu.get("input") or {}
-        yield anth.anthropic_stream_input_json_delta(
-            idx, partial_json=json.dumps(inp, ensure_ascii=False)
-        )
-        yield anth.anthropic_stream_block_stop(idx)
-        idx += 1
-    yield anth.anthropic_stream_message_delta(stop_reason="tool_use")
-    yield anth.anthropic_stream_message_stop()
-
-    openai_tool_calls = web_search_tool.anthropic_tool_use_to_openai(tool_uses)
-    search_results = await web_search_tool.execute_search_tool_calls(openai_tool_calls)
-
-    messages = original_messages
-    for tu in tool_uses:
-        tuid = tu.get("id") or ""
-        result_text = search_results.get(tuid) or "未找到搜索结果"
-        messages = web_search_tool.anthropic_messages_with_tool_result(
-            messages, assistant_message, tuid, result_text
-        )
-
-    final_body = {**body, "messages": messages}
-    for idx2, creds in enumerate(chain):
-        headers = upstream_headers(creds.token, model)
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
-                async with client.stream("POST", url, headers=headers, json=final_body) as resp:
-                    if resp.status_code >= 400:
-                        err_text = (await resp.aread()).decode("utf-8", errors="replace")[:500]
-                        if _retryable_status(resp.status_code) and idx2 < len(chain) - 1:
-                            continue
-                        yield anth.anthropic_stream_error(f"Upstream {resp.status_code}: {err_text}")
-                        return
-                    assembler = anth.AnthropicStreamAssembler(message_id=message_id, model=model)
-                    for ev in assembler.start():
-                        yield ev
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if "text/event-stream" in ctype or "stream" in ctype:
-                        async for line in resp.aiter_lines():
-                            if await client_disconnected():
-                                return
-                            parsed = _parse_sse_line(line)
-                            if parsed is None or parsed == "[DONE]":
-                                continue
-                            c, r, tc_delta = _extract_delta_parts(parsed)
-                            if c or r or tc_delta:
-                                for ev in assembler.feed(content=c or None, reasoning=r or None, tool_calls=tc_delta):
-                                    yield ev
-                            choices = parsed.get("choices") or []
-                            if choices and choices[0].get("finish_reason"):
-                                for ev in assembler.finish(choices[0]["finish_reason"]):
-                                    yield ev
-                                return
-                    else:
-                        raw = await resp.aread()
-                        try:
-                            data = json.loads(raw)
-                        except json.JSONDecodeError:
-                            text = raw.decode("utf-8", errors="replace")
-                            for ev in assembler.feed(content=text):
-                                yield ev
-                            for ev in assembler.finish("stop"):
-                                yield ev
-                            return
-                        c, r, tc_delta = _extract_delta_parts(data)
-                        if c or r or tc_delta:
-                            for ev in assembler.feed(content=c or None, reasoning=r or None, tool_calls=tc_delta):
-                                yield ev
-                        choices = data.get("choices") or []
-                        fr = choices[0].get("finish_reason") if choices else "stop"
-                        for ev in assembler.finish(fr or "stop"):
-                            yield ev
-                        return
-            return
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            if idx2 < len(chain) - 1:
-                continue
-            yield anth.anthropic_stream_error("Search final step failed")
-            return
 
 
 # Mount static assets if present (css/js under /static)
