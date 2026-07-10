@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-10-rsc-sso-2"
+ADAPTER_BUILD = "2026-07-10-rsc-sso-3"
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -444,27 +444,29 @@ def _run_registration(
         sc = list(getattr(res, "set_cookies", None) or [])
         rsc_body = getattr(res, "rsc_body", "") or ""
         rsc_preview = rsc_body[:800]
-        http_status = getattr(res, "http_status", None)
+        http_status = int(getattr(res, "http_status", 0) or 0)
         print(f"[grok-build-auth] create_account HTTP={http_status}")
         print(f"[grok-build-auth] create_account set-cookies count={len(sc)}")
         print(f"[grok-build-auth] create_account rsc_body preview: {rsc_preview}")
         print(f"[grok-build-auth] adapter_build={ADAPTER_BUILD}")
+        sess["create_account_http"] = http_status
+        sess["create_account_ok_flag"] = bool(getattr(res, "ok", False))
+        sess["create_account_set_cookies"] = len(sc)
 
-        # IMPORTANT: HTTP 200 + Next.js RSC flight is transport success for current
-        # xAI sign-up. SSO is extracted afterwards and is the real gate.
-        is_rsc_ok = bool(
-            http_status == 200
-            and (
-                "$Sreact.fragment" in rsc_body
-                or "react.fragment" in rsc_body.lower()
-                or "/_next/static/chunks/" in rsc_body
-                or bool(getattr(res, "ok", False))
+        # Absolute rule: never fail solely because of Next.js RSC body shape.
+        # The body you reported (`2:"$Sreact.fragment"...chunks...`) is SUCCESS.
+        transport_ok = http_status == 200 or bool(getattr(res, "ok", False)) or bool(sc)
+        if not transport_ok:
+            raise RuntimeError(
+                "create_account transport failed. "
+                f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; "
+                f"set_cookies={len(sc)}; body_preview={rsc_preview!r}"
             )
+
+        update(
+            "fetching_sso",
+            f"create_account HTTP {http_status} accepted; extracting SSO [{ADAPTER_BUILD}]",
         )
-        if is_rsc_ok:
-            update("fetching_sso", f"create_account HTTP 200 (RSC OK); extracting SSO [{ADAPTER_BUILD}]")
-        else:
-            update("fetching_sso", f"create_account ambiguous; still trying SSO [{ADAPTER_BUILD}]")
 
         sso = None
         try:
@@ -510,27 +512,17 @@ def _run_registration(
             session_cookies["sso"] = sso
             session_cookies["sso-rw"] = sso
 
-        if sso:
-            print(
-                f"[grok-build-auth] SSO obtained after create_account "
-                f"(heuristic_ok={bool(getattr(res, 'ok', False))}, rsc_ok={is_rsc_ok})"
-            )
-        else:
-            # Never use the old "create_account failed: HTTP 200; body=..." wording.
-            # That body is usually a normal Next.js success flight.
-            if is_rsc_ok or http_status == 200:
-                raise RuntimeError(
-                    "create_account returned HTTP 200 (RSC OK) but SSO cookie was not obtained. "
-                    f"adapter_build={ADAPTER_BUILD}; set_cookies={len(sc)}; "
-                    f"cookie_keys={sorted((session_cookies or {}).keys())}; "
-                    f"body_preview={rsc_preview!r}. "
-                    "Usually set-cookie hop is blocked (auth.x.ai / auth.grokusercontent.com / grok.com)."
-                )
+        if not sso:
+            # If you still see "create_account failed: HTTP 200; body=..." you are
+            # NOT running this build. Current builds always use this SSO wording.
             raise RuntimeError(
-                "create_account failed / not confirmed and no SSO cookie. "
-                f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; set_cookies={len(sc)}; "
+                "SSO_COOKIE_MISSING after create_account. "
+                f"adapter_build={ADAPTER_BUILD}; HTTP {http_status}; "
+                f"set_cookies={len(sc)}; "
                 f"cookie_keys={sorted((session_cookies or {}).keys())}; "
-                f"body={rsc_preview!r}"
+                f"body_preview={rsc_preview!r}. "
+                "This means the account step likely succeeded, but the sso "
+                "set-cookie chain failed (auth.x.ai / auth.grokusercontent.com / grok.com)."
             )
 
         # Primary path: SSO cookie → OIDC device flow → auth.json

@@ -47,7 +47,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 
 def _on_startup() -> None:
@@ -883,6 +883,13 @@ def _normalize_stream_finish_reason(
 
 @app.get("/health")
 async def health():
+    reg: dict[str, Any] = {"available": False}
+    try:
+        import grok_build_adapter as _gba
+
+        reg = _gba.registration_available()
+    except Exception as e:  # noqa: BLE001
+        reg = {"available": False, "error": str(e)}
     try:
         pool = account_pool.pool_summary()
         creds = None
@@ -906,11 +913,17 @@ async def health():
             "token_maintainer": token_maintainer.status(),
             "model_health": __import__("model_health").status(),
             "conversation_affinity": conversation_affinity.status(),
+            "registration": reg,
         }
     except AuthError as e:
         return JSONResponse(
             status_code=503,
-            content={"status": "auth_error", "message": str(e), "version": APP_VERSION},
+            content={
+                "status": "auth_error",
+                "message": str(e),
+                "version": APP_VERSION,
+                "registration": reg,
+            },
         )
 
 

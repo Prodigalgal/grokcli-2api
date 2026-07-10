@@ -511,37 +511,26 @@ class XConsoleAuthClient:
         self._last_rsc_body = rsc_body  # store for fetch_sso_token()
         self._last_create_set_cookies = list(set_cookies or [])
 
-        # Hard rule for current xAI deployments:
-        # HTTP 200 + Next.js RSC flight body is transport success.
-        # Real account/session validity is decided by subsequent SSO extraction.
+        # Current xAI Next.js sign-up actions return HTTP 200 with an RSC flight
+        # body (often starting with `2:"$Sreact.fragment"`). That is SUCCESS for
+        # transport purposes. Only mark failure on non-200 or explicit hard errors.
         looks_ok = self._signup_response_looks_ok(
             rsc_body, set_cookies or [], resp_headers or {}
         )
-        rsc_flight = bool(
-            status == 200
-            and (
-                "react.fragment" in rsc_body.lower()
-                or "/_next/static/chunks/" in rsc_body
-                or "react.fragment" in rsc_body
-            )
-        )
-        ok = (status == 200) and (looks_ok or rsc_flight or bool(set_cookies))
-        # Absolute override: never classify the known success flight as failure.
-        if status == 200 and (
-            "$Sreact.fragment" in rsc_body
-            or "$sreact.fragment" in rsc_body.lower()
-            or "/_next/static/chunks/" in rsc_body
-        ):
+        hard_error = self._signup_response_is_hard_error(rsc_body)
+        if status == 200 and not hard_error:
             ok = True
+        else:
+            ok = (status == 200) and looks_ok and not hard_error
         if self.debug:
             print(
                 f"  [create_account] HTTP {status} ok={ok} "
-                f"looks_ok={looks_ok} rsc_flight={rsc_flight} "
+                f"looks_ok={looks_ok} hard_error={hard_error} "
                 f"set_cookies={len(set_cookies or [])} body_len={len(rsc_body)}"
             )
             if status == 200 and not ok:
                 print(
-                    "  [create_account] HTTP 200 but body looks like failure; "
+                    "  [create_account] HTTP 200 classified as failure; "
                     f"preview={rsc_body[:240]!r}"
                 )
         return SignupResult(
@@ -549,6 +538,31 @@ class XConsoleAuthClient:
             set_cookies=set_cookies,
             rsc_body=rsc_body,
         )
+
+    @staticmethod
+    def _signup_response_is_hard_error(rsc_body: str) -> bool:
+        """True only for explicit signup failures (not normal RSC flights)."""
+        text = (rsc_body or "")
+        text_l = text.lower()
+        if re.search(r"(?m)^\d+:E\{", text):
+            return True
+        markers = (
+            "invalid-credentials",
+            "email already",
+            "already exists",
+            "already registered",
+            "account already",
+            "email_already_in_use",
+            "user_already_exists",
+            "wke=",
+            "wke:",
+            "rate limit",
+            "too many requests",
+            "access denied",
+            "signup failed",
+            "sign-up failed",
+        )
+        return any(m in text_l for m in markers)
 
     @staticmethod
     def _signup_response_looks_ok(
