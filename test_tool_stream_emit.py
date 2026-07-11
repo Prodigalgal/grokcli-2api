@@ -150,12 +150,6 @@ def test_body_requests_tools_tool_choice():
     assert not app._body_requests_tools({})
 
 
-if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            fn()
-            print("ok", name)
-    print("ALL PASS")
 
 
 def test_normalize_strips_builtin_search_tools():
@@ -189,3 +183,11 @@ def test_normalize_tool_choice_search_to_auto():
         "type": "function",
         "function": {"name": "x"},
     }
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print("ok", name)
+    print("ALL PASS")
+
