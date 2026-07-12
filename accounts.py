@@ -234,13 +234,57 @@ def _cleanup_account_side_state(account_ids: list[str]) -> None:
         pass
 
 
-def _backup_auth_file() -> None:
-    if AUTH_FILE.is_file():
-        backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+# File-mode safety net only. When PostgreSQL is primary, auth.json is a mirror
+# and point-in-time recovery should come from PG / export — not local bak spam.
+_AUTH_BAK_KEEP = 5
+
+
+def _auth_file_is_primary() -> bool:
+    return _accounts_store_source() != "postgres"
+
+
+def _auth_bak_paths() -> list:
+    parent = AUTH_FILE.parent
+    if not parent.is_dir():
+        return []
+    # Historical names: auth.bak.<ts> (from Path.with_suffix) and auth.json.bak.<ts>
+    stem = AUTH_FILE.name  # auth.json
+    legacy = AUTH_FILE.stem  # auth
+    out = []
+    try:
+        for p in parent.iterdir():
+            name = p.name
+            if not p.is_file():
+                continue
+            if name.startswith(f"{stem}.bak.") or name.startswith(f"{legacy}.bak."):
+                out.append(p)
+    except OSError:
+        return []
+    out.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return out
+
+
+def _prune_auth_backups(keep: int = _AUTH_BAK_KEEP) -> None:
+    keep = max(0, int(keep))
+    for old in _auth_bak_paths()[keep:]:
         try:
-            shutil.copy2(AUTH_FILE, backup)
+            old.unlink()
         except OSError:
             pass
+
+
+def _backup_auth_file() -> None:
+    """Snapshot auth.json only when it is the durable primary store."""
+    if not _auth_file_is_primary():
+        return
+    if not AUTH_FILE.is_file():
+        return
+    backup = AUTH_FILE.with_name(f"{AUTH_FILE.name}.bak.{int(time.time())}")
+    try:
+        shutil.copy2(AUTH_FILE, backup)
+    except OSError:
+        return
+    _prune_auth_backups(_AUTH_BAK_KEEP)
 
 
 def remove_account(account_id: str) -> bool:
@@ -656,23 +700,18 @@ def merge_normalized_accounts(
             "ok": False,
             "error": "no valid account entries found",
             "imported": [],
-            "total_accounts": len(read_auth_map()) if AUTH_FILE.is_file() else 0,
+            "total_accounts": len(read_auth_map()),
         }
 
     existing: dict[str, Any] = {}
     if merge:
         existing = read_auth_map()
-        if AUTH_FILE.is_file():
-            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
-            try:
-                shutil.copy2(AUTH_FILE, backup)
-            except OSError:
-                pass
-            try:
-                normalize_auth_file_keys()
-                existing = read_auth_map()
-            except Exception:
-                pass
+        _backup_auth_file()
+        try:
+            normalize_auth_file_keys()
+            existing = read_auth_map()
+        except Exception:
+            pass
         for aid, nent in normalized.items():
             uid = nent.get("user_id")
             if not uid:
@@ -799,7 +838,7 @@ def import_auth_payload(
                 "message": "导出文件中无账号，未变更",
                 "imported": [],
                 "auth_file": str(AUTH_FILE),
-                "total_accounts": len(read_auth_map()) if AUTH_FILE.is_file() else 0,
+                "total_accounts": len(read_auth_map()),
             }
         if all(isinstance(v, dict) for v in auth_map.values()):
             parsed = auth_map
@@ -932,6 +971,16 @@ def import_auth_payload(
                     )
         except Exception:
             pass
+        # Best-effort local mirror for export/tools only (do not rewrite PG again —
+        # accounts were already upserted row-by-row above). Runtime reads PG;
+        # missing auth.json must not gate live credentials.
+        try:
+            from auth_store import _write_auth_file, auth_lock
+
+            with auth_lock():
+                _write_auth_file(read_auth_map(), AUTH_FILE)
+        except Exception:
+            pass
         total = 0
         try:
             from store.accounts_pg import count_accounts
@@ -952,17 +1001,12 @@ def import_auth_payload(
     existing: dict[str, Any] = {}
     if merge:
         existing = read_auth_map()
-        if AUTH_FILE.is_file():
-            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
-            try:
-                shutil.copy2(AUTH_FILE, backup)
-            except OSError:
-                pass
-            try:
-                normalize_auth_file_keys()
-                existing = read_auth_map()
-            except Exception:
-                pass
+        _backup_auth_file()
+        try:
+            normalize_auth_file_keys()
+            existing = read_auth_map()
+        except Exception:
+            pass
 
     if merge:
         for aid, nent in normalized.items():

@@ -6,6 +6,8 @@ Endpoints:
   GET  /v1/models
   POST /v1/chat/completions       (OpenAI)
   POST /chat/completions          (alias)
+  POST /v1/responses              (OpenAI Responses API; used by sub2api)
+  POST /responses                 (alias)
   POST /v1/messages               (Anthropic Messages API)
   POST /messages                  (alias)
   POST /v1/messages/count_tokens  (Anthropic token estimate)
@@ -19,6 +21,7 @@ import json
 import os
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
@@ -33,6 +36,7 @@ import account_pool
 import anthropic_compat as anth
 import apikeys
 import conversation_affinity
+import openai_responses as oai_resp
 import token_maintainer
 from admin_routes import router as admin_router
 from auth import AuthError, GrokCredentials, load_credentials, upstream_headers
@@ -50,7 +54,12 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.19"
+APP_VERSION = "1.9.22"
+
+# Per-request usage context (client IP / path / UA) for request-level ledger rows.
+_usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
+    "usage_request_ctx", default=None
+)
 
 # Shared upstream HTTP client (per process / worker) — reuse TLS + keepalive.
 _http_client: httpx.AsyncClient | None = None
@@ -260,6 +269,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _usage_request_context_middleware(request: Request, call_next):
+    """Capture client IP / path / UA for request-level usage events."""
+    try:
+        xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if xff:
+            ip = xff[:80]
+        elif request.client and request.client.host:
+            ip = str(request.client.host)[:80]
+        else:
+            ip = None
+        ua = (request.headers.get("user-agent") or "")[:300] or None
+        path = str(request.url.path or "")[:200] or None
+        token = _usage_request_ctx.set(
+            {
+                "client_ip": ip,
+                "user_agent": ua,
+                "path": path,
+            }
+        )
+    except Exception:
+        token = _usage_request_ctx.set(None)
+    try:
+        return await call_next(request)
+    finally:
+        try:
+            _usage_request_ctx.reset(token)
+        except Exception:
+            pass
+
+
 app.include_router(admin_router)
 
 
@@ -303,6 +344,10 @@ class ChatCompletionRequest(BaseModel):
     # Optional sticky-session hints (clients may set these)
     conversation_id: str | None = None
     metadata: dict[str, Any] | None = None
+    # OpenAI prompt-cache request fields (forwarded when present; also used
+    # for sticky affinity even if upstream ignores them).
+    prompt_cache_key: str | None = None
+    prompt_cache_retention: Any | None = None
 
 
 # ── auth gate for local API ─────────────────────────────────────────────────
@@ -589,10 +634,17 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
         "function_call": req.function_call,
         "response_format": req.response_format,
         "n": req.n,
+        # Prompt-cache request hints (OpenAI / secondary relays). Kept until
+        # _sanitize_upstream_body decides whether upstream accepts them.
+        "prompt_cache_key": req.prompt_cache_key,
+        "prompt_cache_retention": req.prompt_cache_retention,
     }
     for k, v in optional.items():
         if v is not None:
             body[k] = v
+    # Also pick prompt_cache_* from pydantic extras / metadata when clients put
+    # them outside the typed fields (common with new-api param overrides).
+    _merge_prompt_cache_request_fields(body, req)
     # cli-chat-proxy / grok-4.5 rejects several OpenAI sampling knobs that
     # new-api playground enables by default (presence/frequency_penalty, etc.).
     # Strip unsupported fields so secondary relays don't surface empty streams.
@@ -615,14 +667,47 @@ _UPSTREAM_UNSUPPORTED_PARAMS = frozenset(
         "logprobs",
         "top_logprobs",
         "n",
+        # OpenAI prompt-cache request fields are not accepted by cli-chat-proxy.
+        # We still accept them on the public API for sticky affinity + relay
+        # compatibility, then strip before upstream.
+        "prompt_cache_key",
+        "prompt_cache_retention",
     }
 )
+
+
+def _merge_prompt_cache_request_fields(body: dict[str, Any], req: Any) -> None:
+    """Copy prompt_cache_key / retention from request extras into body if missing."""
+    if not isinstance(body, dict):
+        return
+    if body.get("prompt_cache_key") in (None, ""):
+        pck = conversation_affinity.extract_prompt_cache_key(req)
+        if pck:
+            body["prompt_cache_key"] = pck
+    if body.get("prompt_cache_retention") is None:
+        ret = getattr(req, "prompt_cache_retention", None)
+        if ret is None and isinstance(req, dict):
+            ret = req.get("prompt_cache_retention")
+        if ret is None:
+            extra = getattr(req, "model_extra", None)
+            if isinstance(extra, dict):
+                ret = extra.get("prompt_cache_retention")
+        if ret is None:
+            meta = getattr(req, "metadata", None)
+            if meta is None and isinstance(req, dict):
+                meta = req.get("metadata")
+            if isinstance(meta, dict):
+                ret = meta.get("prompt_cache_retention")
+        if ret is not None:
+            body["prompt_cache_retention"] = ret
 
 
 def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -> None:
     """Drop/clamp fields that cli-chat-proxy rejects for Grok models."""
     # Internal bookkeeping must never reach upstream.
     body.pop("_history_compact", None)
+    body.pop("_prompt_cache_key", None)
+    body.pop("_prompt_cache_retention", None)
     # Deprecated live-search knobs → 410 on current cli-chat-proxy builds.
     body.pop("search_parameters", None)
     body.pop("web_search_options", None)
@@ -806,13 +891,43 @@ def _completion_tokens_estimate(
     return total
 
 
+def _usage_detail_int(usage: dict[str, Any] | None, *paths: Any) -> int:
+    """Read a nested usage detail int from the first matching path.
+
+    Each path is either a top-level key (str) or a (parent, child) pair for
+    nested objects like prompt_tokens_details.cached_tokens.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    for path in paths:
+        try:
+            if isinstance(path, (tuple, list)) and len(path) == 2:
+                parent, child = path
+                node = usage.get(parent)
+                if not isinstance(node, dict):
+                    continue
+                val = int(node.get(child) or 0)
+            else:
+                val = int(usage.get(path) or 0)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            return val
+    return 0
+
+
 def _normalize_usage(
     usage: dict[str, Any] | None,
     *,
     prompt_fallback: int = 0,
     completion_fallback: int = 0,
-) -> dict[str, int]:
-    """Normalize OpenAI-style usage; fill missing fields for secondary relays."""
+) -> dict[str, Any]:
+    """Normalize OpenAI-style usage; fill missing fields for secondary relays.
+
+    Always includes cache/reasoning detail containers (0 when unknown) so
+    sub2api / Claude Code can read prompt-cache fields instead of treating
+    a missing key as "no cache support".
+    """
     prompt = 0
     completion = 0
     if isinstance(usage, dict):
@@ -860,10 +975,43 @@ def _normalize_usage(
             reported_total = 0
         if reported_total > total:
             total = reported_total
+
+    # Prompt-cache / reasoning details: passthrough only, never invent hits.
+    cached = _usage_detail_int(
+        usage,
+        ("prompt_tokens_details", "cached_tokens"),
+        ("input_tokens_details", "cached_tokens"),
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "prompt_cache_hit_tokens",
+    )
+    cache_creation = _usage_detail_int(
+        usage,
+        "cache_creation_input_tokens",
+        ("prompt_tokens_details", "cache_creation_tokens"),
+        ("input_tokens_details", "cache_creation_tokens"),
+    )
+    reasoning = _usage_detail_int(
+        usage,
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+        "reasoning_tokens",
+    )
+
     return {
         "prompt_tokens": int(prompt),
         "completion_tokens": int(completion),
         "total_tokens": int(total),
+        # Dual aliases so chat-completions and Responses clients both work.
+        "input_tokens": int(prompt),
+        "output_tokens": int(completion),
+        "prompt_tokens_details": {"cached_tokens": int(cached)},
+        "input_tokens_details": {"cached_tokens": int(cached)},
+        "completion_tokens_details": {"reasoning_tokens": int(reasoning)},
+        "output_tokens_details": {"reasoning_tokens": int(reasoning)},
+        # Anthropic-shaped mirrors (harmless for OpenAI clients).
+        "cache_read_input_tokens": int(cached),
+        "cache_creation_input_tokens": int(cache_creation),
     }
 
 
@@ -874,7 +1022,7 @@ def _usage_from_body_and_output(
     reasoning: str = "",
     tool_calls: list[Any] | None = None,
     usage: dict[str, Any] | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     prompt_fb = _messages_prompt_estimate(body.get("messages"))
     # tools schema also consumes prompt tokens roughly
     if body.get("tools"):
@@ -888,6 +1036,100 @@ def _usage_from_body_and_output(
     return _normalize_usage(
         usage, prompt_fallback=prompt_fb, completion_fallback=completion_fb
     )
+
+
+def _capture_usage_request_ctx(request: Request | None = None) -> dict[str, Any]:
+    """Snapshot request meta for usage events (safe to pass into stream tasks)."""
+    ctx = dict(_usage_request_ctx.get() or {})
+    if request is None:
+        return ctx
+    try:
+        if not ctx.get("client_ip"):
+            xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+            if xff:
+                ctx["client_ip"] = xff[:80]
+            elif request.client and request.client.host:
+                ctx["client_ip"] = str(request.client.host)[:80]
+        if not ctx.get("user_agent"):
+            ua = (request.headers.get("user-agent") or "")[:300]
+            if ua:
+                ctx["user_agent"] = ua
+        if not ctx.get("path"):
+            path = str(request.url.path or "")[:200]
+            if path:
+                ctx["path"] = path
+    except Exception:
+        pass
+    return ctx
+
+
+def _bind_usage_request_ctx(ctx: dict[str, Any] | None):
+    """Bind usage request context for the current async task; returns reset token."""
+    try:
+        return _usage_request_ctx.set(dict(ctx) if isinstance(ctx, dict) else None)
+    except Exception:
+        return None
+
+
+def _reset_usage_request_ctx(token) -> None:
+    if token is None:
+        return
+    try:
+        _usage_request_ctx.reset(token)
+    except Exception:
+        pass
+
+
+def _record_usage_safe(
+    *,
+    usage: dict[str, Any] | None = None,
+    ok: bool = True,
+    api_key_id: str | None = None,
+    account_id: str | None = None,
+    model: str | None = None,
+    protocol: str | None = None,
+    stream: bool | None = None,
+    path: str | None = None,
+    client_ip: str | None = None,
+    user_agent: str | None = None,
+    status_code: int | None = None,
+    latency_ms: int | None = None,
+    error: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort proxy usage ledger; never raises into the chat path."""
+    try:
+        import usage_stats
+
+        ctx = _usage_request_ctx.get() or {}
+        usage_stats.record_usage(
+            usage=usage,
+            ok=ok,
+            api_key_id=api_key_id,
+            account_id=account_id,
+            model=model,
+            protocol=protocol,
+            stream=stream,
+            path=path or ctx.get("path"),
+            client_ip=client_ip or ctx.get("client_ip"),
+            user_agent=user_agent or ctx.get("user_agent"),
+            status_code=status_code,
+            latency_ms=latency_ms,
+            error=error,
+            detail=detail,
+        )
+    except Exception:
+        pass
+
+
+def _api_key_id(rec: apikeys.ApiKeyRecord | None) -> str | None:
+    if rec is None:
+        return None
+    kid = getattr(rec, "id", None)
+    if not kid:
+        return None
+    s = str(kid).strip()
+    return s or None
 
 
 async def _aiter_sse_lines_with_keepalive(
@@ -1785,6 +2027,7 @@ def _admin_page(name: str = "index"):
         "guide": "guide.html",
         "settings": "settings.html",
         "logs": "logs.html",
+        "usage": "usage.html",
     }
     filename = allowed.get((name or "index").strip().lower())
     if not filename:
@@ -1835,6 +2078,7 @@ async def root():
             "GET /health",
             "GET /v1/models",
             "POST /v1/chat/completions",
+            "POST /v1/responses",
             "POST /v1/messages",
             "POST /v1/messages/count_tokens",
             "Admin /admin",
@@ -1842,6 +2086,7 @@ async def root():
         "hint": (
             "OpenAI base_url → <your-host>/v1 · "
             "Anthropic base_url → <your-host> (or /v1). "
+            "Responses API (sub2api) → <your-host>/v1/responses. "
             "Use the same host/port you open in the browser; "
             "set GROK2API_PUBLIC_BASE_URL if behind reverse proxy."
         ),
@@ -1890,6 +2135,12 @@ async def admin_logs_page():
     return _admin_or_404("logs")
 
 
+@app.get("/admin/usage")
+@app.get("/admin/usage/")
+async def admin_usage_page():
+    return _admin_or_404("usage")
+
+
 @app.get("/admin/models")
 @app.get("/admin/models/")
 async def admin_models_page():
@@ -1929,23 +2180,30 @@ def _resolve_conversation_affinity(
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     ) or conversation_affinity.extract_conversation_id_from_body(req)
+    pck = conversation_affinity.extract_prompt_cache_key(req)
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
         user=req.user,
         conversation_id=conv_id,
+        prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
     return fp, prefer
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
-@app.post("/chat/completions", dependencies=[Depends(require_api_key)])
-async def chat_completions(req: ChatCompletionRequest, request: Request):
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
+):
     if not req.messages:
         return openai_error(
             "messages is required", status=400, err_type="invalid_request_error"
         )
 
+    key_id = _api_key_id(api_key)
     conv_fp, prefer_account = await asyncio.to_thread(
         _resolve_conversation_affinity, req, request
     )
@@ -1998,6 +2256,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 created=created,
                 client_disconnected=request.is_disconnected,
                 conversation_fp=conv_fp,
+                api_key_id=key_id,
+                usage_ctx=_capture_usage_request_ctx(request),
             ),
             media_type="text/event-stream",
             headers={
@@ -2077,6 +2337,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 tool_calls=tool_calls,
                 usage=usage,
             )
+            _record_usage_safe(
+                usage=result["usage"],
+                ok=True,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="openai",
+                stream=False,
+            )
             # non-standard but useful for multi-account debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
@@ -2104,6 +2373,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 inc("g2a_upstream_failures_total")
             except Exception:
                 pass
+            _record_usage_safe(
+                ok=False,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="openai",
+                stream=False,
+            )
             last_error = f"Upstream {code}: {detail}"
             last_status = code
             if not _retryable_status(code):
@@ -2123,6 +2400,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 inc("g2a_upstream_failures_total")
             except Exception:
                 pass
+            _record_usage_safe(
+                ok=False,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="openai",
+                stream=False,
+            )
             last_error = f"Proxy error: {e}"
             last_status = 502
             continue
@@ -2180,9 +2465,41 @@ async def _stream_proxy_with_failover(
     created: int,
     client_disconnected,
     conversation_fp: str | None = None,
+    api_key_id: str | None = None,
+    usage_ctx: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     # Do NOT emit a premature role chunk before upstream accepts — secondary
     # relays treat early chunks as stream-started and cannot safely failover.
+    _usage_tok = _bind_usage_request_ctx(usage_ctx)
+    try:
+        async for chunk in _stream_proxy_with_failover_inner(
+            url=url,
+            body=body,
+            chain=chain,
+            chat_id=chat_id,
+            model=model,
+            created=created,
+            client_disconnected=client_disconnected,
+            conversation_fp=conversation_fp,
+            api_key_id=api_key_id,
+        ):
+            yield chunk
+    finally:
+        _reset_usage_request_ctx(_usage_tok)
+
+
+async def _stream_proxy_with_failover_inner(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    chat_id: str,
+    model: str,
+    created: int,
+    client_disconnected,
+    conversation_fp: str | None = None,
+    api_key_id: str | None = None,
+) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
     role_sent = False
@@ -2230,6 +2547,14 @@ async def _stream_proxy_with_failover(
                         status_code=resp.status_code,
                         model=model,
                         headers=dict(resp.headers),
+                    )
+                    _record_usage_safe(
+                        ok=False,
+                        api_key_id=api_key_id,
+                        account_id=creds.auth_key,
+                        model=model,
+                        protocol="openai",
+                        stream=True,
                     )
                     last_err = f"Upstream {resp.status_code}: {err_text}"
                     # try next account if retryable and more remain
@@ -2711,6 +3036,15 @@ async def _stream_proxy_with_failover(
                     include_choices=False,
                 )
                 yield "data: [DONE]\n\n"
+            _record_usage_safe(
+                usage=norm_usage,
+                ok=True,
+                api_key_id=api_key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="openai",
+                stream=True,
+            )
             return
         except asyncio.CancelledError:
             return
@@ -2726,6 +3060,14 @@ async def _stream_proxy_with_failover(
             # Never failover after bytes were already streamed to the client —
             # secondary relays treat that as a mid-stream corruption / break.
             if stream_started or role_sent:
+                _record_usage_safe(
+                    ok=False,
+                    api_key_id=api_key_id,
+                    account_id=creds.auth_key,
+                    model=model,
+                    protocol="openai",
+                    stream=True,
+                )
                 err_payload = {
                     "id": chat_id,
                     "object": "error",
@@ -2737,6 +3079,14 @@ async def _stream_proxy_with_failover(
                 yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
+            _record_usage_safe(
+                ok=False,
+                api_key_id=api_key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="openai",
+                stream=True,
+            )
             if idx < len(chain) - 1:
                 continue
             err_payload = {
@@ -2889,10 +3239,16 @@ def _resolve_anthropic_affinity(
                 conv_id = str(req.metadata[k])
                 break
     oa_msgs = anth.affinity_messages_from_request(req)
+    # Prefer explicit metadata cache/session keys; fall back to cache_control
+    # fingerprint derived from system/tools so Claude Code multi-turn sticks.
+    pck = conversation_affinity.extract_prompt_cache_key(req)
+    if not pck:
+        pck = anth.extract_anthropic_prompt_cache_key(req)
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
         user=anth.metadata_user_id(req),
         conversation_id=conv_id,
+        prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
     return fp, prefer
@@ -2918,12 +3274,13 @@ def _anthropic_error_response(
     )
 
 
-@app.post("/v1/messages", dependencies=[Depends(require_api_key)])
-@app.post("/messages", dependencies=[Depends(require_api_key)])
+@app.post("/v1/messages")
+@app.post("/messages")
 async def anthropic_messages(
     req: anth.AnthropicMessagesRequest,
     request: Request,
     anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
     """
     Anthropic Messages API compatible endpoint.
@@ -2931,6 +3288,7 @@ async def anthropic_messages(
     Optional header: `anthropic-version` (accepted, not enforced).
     """
     _ = anthropic_version  # accepted for client compatibility
+    key_id = _api_key_id(api_key)
     if not req.messages:
         return _anthropic_error_response(
             "messages: Field required",
@@ -3015,6 +3373,8 @@ async def anthropic_messages(
                 model=model,
                 client_disconnected=request.is_disconnected,
                 conversation_fp=conv_fp,
+                api_key_id=key_id,
+                usage_ctx=_capture_usage_request_ctx(request),
             ),
             media_type="text/event-stream",
             headers={
@@ -3072,6 +3432,39 @@ async def anthropic_messages(
                 model=model,
                 message_id=message_id,
             )
+            # Normalize Anthropic usage (input/output + cache details) for the ledger.
+            au = result.get("usage") if isinstance(result, dict) else None
+            ledger_usage = None
+            if isinstance(au, dict):
+                ledger_usage = _normalize_usage(
+                    {
+                        "prompt_tokens": au.get("input_tokens") or 0,
+                        "completion_tokens": au.get("output_tokens") or 0,
+                        "cache_read_input_tokens": au.get("cache_read_input_tokens")
+                        or 0,
+                        "cache_creation_input_tokens": au.get(
+                            "cache_creation_input_tokens"
+                        )
+                        or 0,
+                    }
+                )
+            else:
+                ledger_usage = _usage_from_body_and_output(
+                    body,
+                    content=content or "",
+                    reasoning=reasoning or "",
+                    tool_calls=tool_calls,
+                    usage=usage,
+                )
+            _record_usage_safe(
+                usage=ledger_usage,
+                ok=True,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="anthropic",
+                stream=False,
+            )
             # non-standard debug fields (ignored by strict SDKs that allow extra)
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
@@ -3096,6 +3489,14 @@ async def anthropic_messages(
                 inc("g2a_upstream_failures_total")
             except Exception:
                 pass
+            _record_usage_safe(
+                ok=False,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="anthropic",
+                stream=False,
+            )
             last_error = f"Upstream {code}: {detail}"
             last_status = code
             if not _retryable_status(code):
@@ -3115,6 +3516,14 @@ async def anthropic_messages(
                 inc("g2a_upstream_failures_total")
             except Exception:
                 pass
+            _record_usage_safe(
+                ok=False,
+                api_key_id=key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="anthropic",
+                stream=False,
+            )
             last_error = f"Proxy error: {e}"
             last_status = 502
             continue
@@ -3143,6 +3552,347 @@ async def anthropic_count_tokens(req: anth.AnthropicMessagesRequest):
     return anth.count_tokens_for_request(req)
 
 
+# ── OpenAI Responses API (sub2api Anthropic→OpenAI path) ─────────────────────
+
+
+def _responses_affinity(
+    messages: list[dict[str, Any]], req_body: dict[str, Any], request: Request
+) -> tuple[str | None, str | None]:
+    conv_id = conversation_affinity.extract_conversation_id_from_headers(
+        request.headers
+    )
+    if not conv_id and isinstance(req_body.get("metadata"), dict):
+        meta = req_body["metadata"]
+        for k in ("conversation_id", "session_id", "thread_id"):
+            if meta.get(k):
+                conv_id = str(meta[k])
+                break
+    if not conv_id and req_body.get("previous_response_id"):
+        # Best-effort sticky key when continuing a stored response chain.
+        conv_id = f"prev:{req_body.get('previous_response_id')}"
+    user = req_body.get("user")
+    if not user and isinstance(req_body.get("metadata"), dict):
+        user = req_body["metadata"].get("user")
+    pck = conversation_affinity.extract_prompt_cache_key(req_body)
+    fp = conversation_affinity.conversation_fingerprint(
+        messages,
+        user=str(user) if user else None,
+        conversation_id=conv_id,
+        prompt_cache_key=pck,
+    )
+    prefer = conversation_affinity.get_affinity(fp) if fp else None
+    return fp, prefer
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def openai_responses(
+    request: Request,
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
+):
+    """OpenAI Responses API compatibility endpoint.
+
+    sub2api converts Claude Code /v1/messages → Responses and POSTs here when the
+    account platform is openai. We translate to chat/completions against Grok
+    upstream, then map the completion back to Responses JSON / SSE.
+    """
+    try:
+        req_body = await request.json()
+    except Exception:
+        return openai_error(
+            "Invalid JSON body", status=400, err_type="invalid_request_error"
+        )
+    if not isinstance(req_body, dict):
+        return openai_error(
+            "Request body must be a JSON object",
+            status=400,
+            err_type="invalid_request_error",
+        )
+
+    key_id = _api_key_id(api_key)
+    model = resolve_model(req_body.get("model"))
+    want_stream = bool(req_body.get("stream"))
+    response_id = oai_resp.new_response_id()
+    created_at = int(time.time())
+
+    body = oai_resp.responses_request_to_chat_body(req_body, model=model)
+    if not body.get("messages"):
+        return openai_error(
+            "input must contain at least one message",
+            status=400,
+            err_type="invalid_request_error",
+        )
+
+    conv_fp, prefer_account = await asyncio.to_thread(
+        _responses_affinity, body.get("messages") or [], req_body, request
+    )
+
+    try:
+        def _pick_chain():
+            chain = account_pool.try_acquire_sequence(
+                model=model, prefer_account_id=prefer_account
+            )
+            if not chain:
+                chain = [account_pool.acquire(model=model)]
+            return chain
+
+        chain = await asyncio.to_thread(_pick_chain)
+    except AuthError as e:
+        try:
+            from store.metrics import inc
+
+            inc("g2a_auth_failures_total")
+        except Exception:
+            pass
+        return _client_pool_error(e)
+
+    try:
+        from store.metrics import inc
+
+        inc("g2a_requests_total")
+        if prefer_account:
+            inc("g2a_affinity_hits_total")
+        elif conv_fp:
+            inc("g2a_affinity_misses_total")
+    except Exception:
+        pass
+
+    # Force upstream stream collection path (same as chat non-stream clients).
+    if FORCE_UPSTREAM_STREAM:
+        body["stream"] = True
+    _sanitize_upstream_body(body, model=model)
+    _ensure_stream_include_usage(body)
+    _apply_history_compact(body)
+    url = f"{UPSTREAM_BASE}/chat/completions"
+    compact_hdr = _history_compact_headers(body)
+    prev_id = req_body.get("previous_response_id")
+    metadata = req_body.get("metadata") if isinstance(req_body.get("metadata"), dict) else None
+
+    async def _run_with_failover() -> tuple[
+        str, str, str | None, dict[str, Any] | None, list[dict[str, Any]] | None, GrokCredentials
+    ]:
+        last_error: str | None = None
+        last_status = 502
+        first_tried: str | None = chain[0].auth_key if chain else None
+        for creds in chain:
+            headers = upstream_headers(creds.token, model)
+            try:
+                content, reasoning, finish, usage, tool_calls = await _collect_completion(
+                    url=url, headers=headers, body=body
+                )
+                await asyncio.to_thread(
+                    account_pool.report_success, creds.auth_key, model=model
+                )
+                if conv_fp:
+                    if prefer_account and prefer_account != creds.auth_key:
+                        await asyncio.to_thread(
+                            conversation_affinity.rebind_on_failover,
+                            conv_fp,
+                            first_tried,
+                            creds.auth_key,
+                        )
+                        try:
+                            from store.metrics import inc
+
+                            inc("g2a_account_failovers_total")
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.to_thread(
+                            conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                        )
+                return content, reasoning, finish, usage, tool_calls, creds
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code if e.response is not None else 502
+                detail = e.response.text[:800] if e.response is not None else str(e)
+                hdrs = dict(e.response.headers) if e.response is not None else None
+                await asyncio.to_thread(
+                    account_pool.report_failure,
+                    creds.auth_key,
+                    error=detail,
+                    status_code=code,
+                    model=model,
+                    headers=hdrs,
+                )
+                try:
+                    from store.metrics import inc
+
+                    inc("g2a_upstream_failures_total")
+                except Exception:
+                    pass
+                _record_usage_safe(
+                    ok=False,
+                    api_key_id=key_id,
+                    account_id=creds.auth_key,
+                    model=model,
+                    protocol="openai_responses",
+                    stream=want_stream,
+                )
+                last_error = f"Upstream {code}: {detail}"
+                last_status = code
+                if not _retryable_status(code):
+                    break
+                continue
+            except Exception as e:  # noqa: BLE001
+                await asyncio.to_thread(
+                    account_pool.report_failure,
+                    creds.auth_key,
+                    error=str(e),
+                    status_code=502,
+                    model=model,
+                )
+                try:
+                    from store.metrics import inc
+
+                    inc("g2a_upstream_failures_total")
+                except Exception:
+                    pass
+                _record_usage_safe(
+                    ok=False,
+                    api_key_id=key_id,
+                    account_id=creds.auth_key,
+                    model=model,
+                    protocol="openai_responses",
+                    stream=want_stream,
+                )
+                last_error = f"Proxy error: {e}"
+                last_status = 502
+                continue
+        final_status = last_status if last_status < 600 else 502
+        friendly = _sanitize_upstream_error_message(last_error or "", final_status)
+        raise RuntimeError(friendly or last_error or "All accounts failed")
+
+    if want_stream:
+        _resp_usage_ctx = _capture_usage_request_ctx(request)
+
+        async def _sse_gen() -> AsyncIterator[str]:
+            _usage_tok = _bind_usage_request_ctx(_resp_usage_ctx)
+            try:
+                try:
+                    content, reasoning, _finish, usage, tool_calls, creds = (
+                        await _run_with_failover()
+                    )
+                except RuntimeError as e:
+                    for frame in oai_resp.failed_responses_sse(
+                        response_id=response_id, message=str(e)
+                    ):
+                        yield frame
+                    return
+                except Exception as e:  # noqa: BLE001
+                    for frame in oai_resp.failed_responses_sse(
+                        response_id=response_id, message=f"Proxy error: {e}"
+                    ):
+                        yield frame
+                    return
+
+                ledger_usage = _usage_from_body_and_output(
+                    body,
+                    content=content or "",
+                    reasoning=reasoning or "",
+                    tool_calls=tool_calls,
+                    usage=usage,
+                )
+                _record_usage_safe(
+                    usage=ledger_usage,
+                    ok=True,
+                    api_key_id=key_id,
+                    account_id=creds.auth_key,
+                    model=model,
+                    protocol="openai_responses",
+                    stream=True,
+                )
+                for frame in oai_resp.iter_responses_sse_from_completion(
+                    response_id=response_id,
+                    model=model,
+                    content=content or "",
+                    reasoning=reasoning or "",
+                    tool_calls=tool_calls,
+                    usage=ledger_usage,
+                    created_at=created_at,
+                    previous_response_id=str(prev_id) if prev_id else None,
+                    metadata=metadata,
+                ):
+                    if await request.is_disconnected():
+                        return
+                    yield frame
+            finally:
+                _reset_usage_request_ctx(_usage_tok)
+
+        return StreamingResponse(
+            _sse_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Grok2API-Protocol": "openai_responses",
+                "X-Grok2API-Accounts": str(len(chain)),
+                "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                **compact_hdr,
+                **(
+                    {"X-Grok2API-Conversation-Fp": conv_fp}
+                    if conv_fp
+                    else {}
+                ),
+            },
+        )
+
+    try:
+        content, reasoning, _finish, usage, tool_calls, creds = await _run_with_failover()
+    except RuntimeError as e:
+        msg = str(e)
+        # Pool / upstream transient → 503 so relays retry.
+        return openai_error(
+            msg or "All accounts failed",
+            status=503,
+            err_type="upstream_error",
+            retry_after=8,
+            code="all_accounts_failed",
+        )
+    except Exception as e:  # noqa: BLE001
+        return openai_error(
+            f"Proxy error: {e}",
+            status=502,
+            err_type="upstream_error",
+        )
+
+    ledger_usage = _usage_from_body_and_output(
+        body,
+        content=content or "",
+        reasoning=reasoning or "",
+        tool_calls=tool_calls,
+        usage=usage,
+    )
+    _record_usage_safe(
+        usage=ledger_usage,
+        ok=True,
+        api_key_id=key_id,
+        account_id=creds.auth_key,
+        model=model,
+        protocol="openai_responses",
+        stream=False,
+    )
+    result = oai_resp.build_responses_object(
+        response_id=response_id,
+        model=model,
+        content=content or "",
+        reasoning=reasoning or "",
+        tool_calls=tool_calls,
+        usage=ledger_usage,
+        created_at=created_at,
+        previous_response_id=str(prev_id) if prev_id else None,
+        metadata=metadata,
+    )
+    result["x_grok2api_account"] = creds.email or creds.auth_key
+    result["x_grok2api_affinity"] = bool(prefer_account)
+    if conv_fp:
+        result["x_grok2api_conversation_fp"] = conv_fp
+    hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
+    if isinstance(hc_stats, dict):
+        result["x_grok2api_history_compact"] = hc_stats
+    return result
+
+
 async def _stream_anthropic_with_failover(
     *,
     url: str,
@@ -3152,8 +3902,38 @@ async def _stream_anthropic_with_failover(
     model: str,
     client_disconnected,
     conversation_fp: str | None = None,
+    api_key_id: str | None = None,
+    usage_ctx: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Upstream OpenAI SSE → Anthropic Messages SSE with account failover."""
+    _usage_tok = _bind_usage_request_ctx(usage_ctx)
+    try:
+        async for chunk in _stream_anthropic_with_failover_inner(
+            url=url,
+            body=body,
+            chain=chain,
+            message_id=message_id,
+            model=model,
+            client_disconnected=client_disconnected,
+            conversation_fp=conversation_fp,
+            api_key_id=api_key_id,
+        ):
+            yield chunk
+    finally:
+        _reset_usage_request_ctx(_usage_tok)
+
+
+async def _stream_anthropic_with_failover_inner(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    message_id: str,
+    model: str,
+    client_disconnected,
+    conversation_fp: str | None = None,
+    api_key_id: str | None = None,
+) -> AsyncIterator[str]:
     last_err: str | None = None
     first_tried = chain[0].auth_key if chain else None
     # Estimate prompt tokens for message_start (sub2api reads this early)
@@ -3196,6 +3976,14 @@ async def _stream_anthropic_with_failover(
                         status_code=resp.status_code,
                         model=model,
                         headers=dict(resp.headers),
+                    )
+                    _record_usage_safe(
+                        ok=False,
+                        api_key_id=api_key_id,
+                        account_id=creds.auth_key,
+                        model=model,
+                        protocol="anthropic",
+                        stream=True,
                     )
                     last_err = f"Upstream {resp.status_code}: {err_text}"
                     if _retryable_status(resp.status_code) and idx < len(
@@ -3299,6 +4087,26 @@ async def _stream_anthropic_with_failover(
                         client_gone=client_gone,
                     ):
                         yield ev
+                    _record_usage_safe(
+                        usage=_usage_from_body_and_output(
+                            body,
+                            usage=usage,
+                            content="",
+                            reasoning="",
+                        )
+                        if usage
+                        else {
+                            "prompt_tokens": prompt_est,
+                            "completion_tokens": 0,
+                            "total_tokens": prompt_est,
+                        },
+                        ok=True,
+                        api_key_id=api_key_id,
+                        account_id=creds.auth_key,
+                        model=model,
+                        protocol="anthropic",
+                        stream=True,
+                    )
                     return
                 else:
                     raw = await resp.aread()
@@ -3316,6 +4124,20 @@ async def _stream_anthropic_with_failover(
                             )
                         ):
                             yield ev
+                        _record_usage_safe(
+                            usage={
+                                "prompt_tokens": prompt_est,
+                                "completion_tokens": _estimate_text_tokens(text),
+                                "total_tokens": prompt_est
+                                + _estimate_text_tokens(text),
+                            },
+                            ok=True,
+                            api_key_id=api_key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="anthropic",
+                            stream=True,
+                        )
                         return
                     else:
                         if isinstance(data.get("usage"), dict):
@@ -3370,6 +4192,26 @@ async def _stream_anthropic_with_failover(
                             )
                         ):
                             yield ev
+                        _record_usage_safe(
+                            usage=_usage_from_body_and_output(
+                                body,
+                                usage=usage,
+                                content="",
+                                reasoning="",
+                            )
+                            if usage
+                            else {
+                                "prompt_tokens": prompt_est,
+                                "completion_tokens": 0,
+                                "total_tokens": prompt_est,
+                            },
+                            ok=True,
+                            api_key_id=api_key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="anthropic",
+                            stream=True,
+                        )
                         return
 
             if not finished:
@@ -3381,6 +4223,26 @@ async def _stream_anthropic_with_failover(
                     )
                 ):
                     yield ev
+            _record_usage_safe(
+                usage=_usage_from_body_and_output(
+                    body,
+                    usage=usage,
+                    content="",
+                    reasoning="",
+                )
+                if usage
+                else {
+                    "prompt_tokens": prompt_est,
+                    "completion_tokens": 0,
+                    "total_tokens": prompt_est,
+                },
+                ok=True,
+                api_key_id=api_key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="anthropic",
+                stream=True,
+            )
             return
         except asyncio.CancelledError:
             return
@@ -3389,6 +4251,14 @@ async def _stream_anthropic_with_failover(
                 creds.auth_key, error=str(e), status_code=502, model=model
             )
             last_err = str(e)
+            _record_usage_safe(
+                ok=False,
+                api_key_id=api_key_id,
+                account_id=creds.auth_key,
+                model=model,
+                protocol="anthropic",
+                stream=True,
+            )
             # Mid-stream failures cannot safely failover for secondary relays
             if stream_started:
                 yield anth.anthropic_stream_error(

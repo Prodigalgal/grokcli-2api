@@ -61,6 +61,16 @@ from settings_store import (
 router = APIRouter(prefix="/admin/api", tags=["admin"])
 
 
+def _usage_light() -> dict[str, Any]:
+    """Best-effort today/lifetime usage for status cards."""
+    try:
+        import usage_stats
+
+        return usage_stats.light_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200], "today_requests": 0, "today_tokens": 0, "total_tokens": 0}
+
+
 # ── request bodies ──────────────────────────────────────────────────────────
 
 
@@ -517,6 +527,7 @@ async def admin_status(request: Request):
         "model_health": model_health.status(light=True),
         "conversation_affinity": conversation_affinity.status(),
         "registration": reg_status,
+        "usage": _usage_light(),
     }
 
 
@@ -621,6 +632,7 @@ async def dashboard(
         "token_maintainer": token_maintainer.status(light=True),
         "model_health": model_health.status(light=True),
         "conversation_affinity": conversation_affinity.status(),
+        "usage": _usage_light(),
         "full": bool(full),
     }
 
@@ -2266,5 +2278,134 @@ async def list_admin_log_actions(
         from store.audit_pg import list_actions
 
         return {"ok": True, "actions": list_actions()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e
+
+
+# ── usage / token stats ─────────────────────────────────────────────────────
+
+
+@router.get("/usage/summary")
+async def usage_summary(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = 7,
+):
+    """Today / last N days / lifetime token + request aggregates."""
+    require_admin(request, x_admin_token)
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(usage_stats.summary, days=days)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"usage summary failed: {e}") from e
+
+
+@router.get("/usage/series")
+async def usage_series(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = 7,
+):
+    require_admin(request, x_admin_token)
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(usage_stats.series, days=days)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e
+
+
+@router.get("/usage/by-key")
+async def usage_by_key(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = 7,
+    limit: int = 50,
+):
+    require_admin(request, x_admin_token)
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(
+            usage_stats.breakdown, "key", days=days, limit=limit
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e
+
+
+@router.get("/usage/by-account")
+async def usage_by_account(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = 7,
+    limit: int = 50,
+):
+    require_admin(request, x_admin_token)
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(
+            usage_stats.breakdown, "account", days=days, limit=limit
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e
+
+
+@router.get("/usage/by-model")
+async def usage_by_model(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    days: int = 7,
+    limit: int = 50,
+):
+    require_admin(request, x_admin_token)
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(
+            usage_stats.breakdown, "model", days=days, limit=limit
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:300]) from e
+
+
+@router.get("/usage/events")
+async def usage_events(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    q: str = "",
+    api_key_id: str = "",
+    account_id: str = "",
+    model: str = "",
+    protocol: str = "",
+    client_ip: str = "",
+    ok: str = "",
+    page: int = 1,
+    page_size: int = 50,
+):
+    """Per-request usage details: tokens, API key, client IP, cache hits."""
+    require_admin(request, x_admin_token)
+    ok_flag: bool | None = None
+    ov = (ok or "").strip().lower()
+    if ov in ("1", "true", "yes", "ok", "success"):
+        ok_flag = True
+    elif ov in ("0", "false", "no", "fail", "failed", "error"):
+        ok_flag = False
+    try:
+        import usage_stats
+
+        return await asyncio.to_thread(
+            usage_stats.list_events,
+            q=q,
+            api_key_id=api_key_id,
+            account_id=account_id,
+            model=model,
+            protocol=protocol,
+            client_ip=client_ip,
+            ok=ok_flag,
+            page=page,
+            page_size=page_size,
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:300]) from e

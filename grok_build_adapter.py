@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-12-protocol-7"
+ADAPTER_BUILD = "2026-07-12-protocol-8"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -385,7 +385,7 @@ def _proxy_url() -> str:
 # --------------------------------------------------------------------------- #
 # registration flow
 # --------------------------------------------------------------------------- #
-def _start_one_registration(
+def _prepare_registration_session(
     *,
     yescaptcha_key: str,
     proxy: str,
@@ -399,7 +399,7 @@ def _start_one_registration(
     batch_total: int | None = None,
     start_delay: float = 0.0,
 ) -> dict[str, Any]:
-    """Create one session object and spawn its worker thread."""
+    """Create mailbox + session record. Does NOT start the registration worker."""
     if start_delay > 0:
         time.sleep(start_delay)
 
@@ -420,12 +420,12 @@ def _start_one_registration(
 
     sess = {
         "id": sid,
-        "status": "started",
+        "status": "queued",
         "created_at": _now(),
         "updated_at": _now(),
         "email": email,
         "password": password,
-        "message": f"started; email={email}",
+        "message": f"queued; email={email}",
         "sso": None,
         "oauth": None,
         "auth_json": None,
@@ -436,6 +436,8 @@ def _start_one_registration(
         "batch_id": batch_id,
         "batch_index": batch_index,
         "batch_total": batch_total,
+        # Keep receiver process-local only (not mirrored to Redis).
+        "_receiver": receiver,
     }
     with _lock:
         _sessions[sid] = sess
@@ -444,14 +446,62 @@ def _start_one_registration(
             _batches[batch_id]["updated_at"] = _now()
             _mirror_reg_batch(batch_id, dict(_batches[batch_id]))
     _mirror_reg_sess(sid, sess)
+    return {"ok": True, **_compact_session(sess)}
 
+
+def _start_one_registration(
+    *,
+    yescaptcha_key: str,
+    proxy: str,
+    moemail_api_key: str | None = None,
+    moemail_base_url: str | None = None,
+    prefix: str | None = None,
+    domain: str | None = None,
+    expiry_ms: int | None = None,
+    batch_id: str | None = None,
+    batch_index: int | None = None,
+    batch_total: int | None = None,
+    start_delay: float = 0.0,
+) -> dict[str, Any]:
+    """Create one session and spawn its worker thread (single-job path)."""
+    prepared = _prepare_registration_session(
+        yescaptcha_key=yescaptcha_key,
+        proxy=proxy,
+        moemail_api_key=moemail_api_key,
+        moemail_base_url=moemail_base_url,
+        prefix=prefix,
+        domain=domain,
+        expiry_ms=expiry_ms,
+        batch_id=batch_id,
+        batch_index=batch_index,
+        batch_total=batch_total,
+        start_delay=start_delay,
+    )
+    if not prepared.get("ok"):
+        return prepared
+    sid = str(prepared.get("id") or "")
+    with _lock:
+        sess = _sessions.get(sid) or {}
+        receiver = sess.get("_receiver")
+    if not sid or receiver is None:
+        return {"ok": False, "error": "registration session prepare failed"}
+    with _lock:
+        if sid in _sessions:
+            _sessions[sid]["status"] = "started"
+            _sessions[sid]["message"] = f"started; email={_sessions[sid].get('email') or ''}"
+            _sessions[sid]["updated_at"] = _now()
+            _mirror_reg_sess(sid, _sessions[sid])
     threading.Thread(
         target=_run_registration,
         args=(sid, yescaptcha_key, proxy or "", receiver),
         daemon=True,
         name=f"gba-reg-{sid[-8:]}",
     ).start()
-    return {"ok": True, **_compact_session(sess)}
+    with _lock:
+        sess = _sessions.get(sid)
+        if sess is None:
+            return prepared
+        return {"ok": True, **_compact_session(sess)}
 
 
 def start_registration(
@@ -469,7 +519,9 @@ def start_registration(
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
-    ``count`` > 1 enables batch mode. Workers are capped by ``concurrency``.
+    ``count`` > 1 enables batch mode. ``concurrency`` is the real in-flight
+    limit: e.g. concurrency=3 means only 3 accounts register at the same time;
+    when one finishes, the next queued account starts.
     """
     try:
         ensure_xconsole()
@@ -552,15 +604,18 @@ def start_registration(
         _batches[batch_id] = batch
     _mirror_reg_batch(batch_id, batch)
 
-    def _spawn_batch() -> None:
+    def _run_batch() -> None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        results: list[dict[str, Any]] = []
         errors: list[str] = []
+        finished = 0
+        ok_n = 0
+        fail_n = 0
 
         def _job(i: int) -> dict[str, Any]:
+            # Small per-slot stagger only (not cumulative across the whole batch).
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
-            return _start_one_registration(
+            prepared = _prepare_registration_session(
                 yescaptcha_key=key,
                 proxy=proxy_val,
                 moemail_api_key=moemail_api_key,
@@ -573,6 +628,40 @@ def start_registration(
                 batch_total=n,
                 start_delay=delay,
             )
+            if not prepared.get("ok"):
+                return prepared
+            sid = str(prepared.get("id") or "")
+            with _lock:
+                sess = _sessions.get(sid) or {}
+                receiver = sess.get("_receiver")
+                if sid in _sessions:
+                    _sessions[sid]["status"] = "started"
+                    _sessions[sid]["message"] = (
+                        f"started; email={_sessions[sid].get('email') or ''}"
+                    )
+                    _sessions[sid]["updated_at"] = _now()
+                    _mirror_reg_sess(sid, _sessions[sid])
+            if not sid or receiver is None:
+                return {"ok": False, "error": "registration session prepare failed", "id": sid}
+            # Run the full registration inside the pool worker so concurrency
+            # truly limits in-flight work (e.g. 3 threads => 3 at a time).
+            try:
+                _run_registration(sid, key, proxy_val or "", receiver)
+            finally:
+                with _lock:
+                    if sid in _sessions:
+                        _sessions[sid].pop("_receiver", None)
+            with _lock:
+                final = _sessions.get(sid) or {}
+            st = str(final.get("status") or "")
+            ok = st in ("imported", "success", "completed")
+            return {
+                "ok": ok,
+                "id": sid,
+                "status": st,
+                "error": final.get("error"),
+                "email": final.get("email"),
+            }
 
         try:
             with ThreadPoolExecutor(
@@ -581,38 +670,66 @@ def start_registration(
                 futs = {pool.submit(_job, i): i for i in range(1, n + 1)}
                 for fut in as_completed(futs):
                     idx = futs[fut]
+                    finished += 1
                     try:
                         r = fut.result()
-                        results.append(r)
-                        if not r.get("ok"):
-                            errors.append(f"#{idx}: {r.get('error') or 'start failed'}")
+                        if r.get("ok"):
+                            ok_n += 1
+                        else:
+                            fail_n += 1
+                            errors.append(
+                                f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
+                            )
                     except Exception as e:  # noqa: BLE001
+                        fail_n += 1
                         errors.append(f"#{idx}: {e}")
+                    with _lock:
+                        b = _batches.get(batch_id)
+                        if b is not None:
+                            b["updated_at"] = _now()
+                            b["status"] = "running"
+                            b["finished"] = finished
+                            b["ok_count"] = ok_n
+                            b["fail_count"] = fail_n
+                            b["spawned"] = len(b.get("session_ids") or [])
+                            b["spawn_errors"] = errors[-20:]
+                            b["message"] = (
+                                f"running {finished}/{n} done "
+                                f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            )
+                            _mirror_reg_batch(batch_id, dict(b))
         finally:
             with _lock:
                 b = _batches.get(batch_id)
                 if b is not None:
                     b["updated_at"] = _now()
-                    b["status"] = "spawned"
+                    b["finished"] = finished
+                    b["ok_count"] = ok_n
+                    b["fail_count"] = fail_n
                     b["spawned"] = len(b.get("session_ids") or [])
-                    b["spawn_errors"] = errors
+                    b["spawn_errors"] = errors[-20:]
+                    if fail_n and not ok_n:
+                        b["status"] = "error"
+                        b["error"] = "; ".join(errors[:5]) or "all failed"
+                    elif fail_n:
+                        b["status"] = "partial"
+                    else:
+                        b["status"] = "done"
                     b["message"] = (
-                        f"spawned {len(b.get('session_ids') or [])}/{n} "
-                        f"(concurrency={workers})"
+                        f"finished {finished}/{n} "
+                        f"(ok={ok_n} fail={fail_n}, threads={workers})"
                         + (f"; errors={len(errors)}" if errors else "")
                     )
-                    if errors and not b.get("session_ids"):
-                        b["status"] = "error"
-                        b["error"] = "; ".join(errors[:5])
+                    _mirror_reg_batch(batch_id, dict(b))
 
     threading.Thread(
-        target=_spawn_batch,
+        target=_run_batch,
         daemon=True,
         name=f"gba-batch-{batch_id[-8:]}",
     ).start()
 
-    # Give the spawner a brief moment so the first session ids are often present.
-    time.sleep(min(0.35, 0.05 * workers + 0.05))
+    # Brief wait so the first wave (up to `workers`) is usually visible to UI.
+    time.sleep(min(0.45, 0.08 * workers + 0.08))
     with _lock:
         b = dict(_batches.get(batch_id) or batch)
         sids = list(b.get("session_ids") or [])
@@ -629,8 +746,8 @@ def start_registration(
         "sessions": sessions,
         "adapter_build": ADAPTER_BUILD,
         "message": (
-            f"batch started: count={n}, concurrency={workers}, "
-            f"spawned={len(sids)}"
+            f"batch started: count={n}, threads={workers} "
+            f"(in-flight cap), queued/started={len(sids)}"
         ),
         # Back-compat: first session fields for old UI single-session path.
         **(sessions[0] if sessions else {"id": None, "status": "starting"}),

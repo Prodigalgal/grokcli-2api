@@ -138,6 +138,7 @@ const PAGE_META = {
   overview: { title: "概览", sub: "服务状态、账号池与 Token 健康度一览" },
   keys: { title: "API Keys", sub: "创建、复制、停用客户端访问密钥" },
   accounts: { title: "账号 / 轮询", sub: "Grok 账号、设备码登录、额度与导入导出" },
+  usage: { title: "用量", sub: "Token 消耗与请求使用情况（今日 / 近 N 天 / 累计）" },
   logs: { title: "日志", sub: "查询系统与管理台日志（登录、账号、Key、探测、冷却、设置等）" },
   models: { title: "模型", sub: "上游模型缓存与探测结果" },
   settings: { title: "系统设置", sub: "修改管理员密码、轮询策略与 sub2api / 维护参数" },
@@ -161,7 +162,7 @@ function showMain() {
   startAutoUiRefresh();
 }
 
-const PAGE_HREF = { overview: "/admin", keys: "/admin/keys", accounts: "/admin/accounts", logs: "/admin/logs", models: "/admin/models", settings: "/admin/settings", guide: "/admin/guide" };
+const PAGE_HREF = { overview: "/admin", keys: "/admin/keys", accounts: "/admin/accounts", usage: "/admin/usage", logs: "/admin/logs", models: "/admin/models", settings: "/admin/settings", guide: "/admin/guide" };
 let _softNavToken = 0;
 let _softNavBusy = false;
 let _softNavBusySince = 0;
@@ -170,6 +171,7 @@ function pageFromPath(pathname) {
   const p = (pathname || location.pathname || "").replace(/\/$/, "") || "/admin";
   if (p.endsWith("/keys")) return "keys";
   if (p.endsWith("/accounts")) return "accounts";
+  if (p.endsWith("/usage")) return "usage";
   if (p.endsWith("/logs")) return "logs";
   if (p.endsWith("/models")) return "models";
   if (p.endsWith("/settings")) return "settings";
@@ -295,6 +297,7 @@ async function softNavigate(name, opts) {
       if (page === "accounts" && typeof renderAccounts === "function") renderAccounts();
       if (page === "keys" && typeof renderKeys === "function") renderKeys();
       if (page === "logs" && typeof loadAdminLogs === "function") loadAdminLogs({ reset: false });
+      if (page === "usage" && typeof loadUsage === "function") loadUsage();
       if (page === "models" && typeof renderModels === "function") renderModels();
       if (page === "guide" && typeof renderGuide === "function") renderGuide();
       if (page === "overview" && typeof renderStats === "function") renderStats();
@@ -352,6 +355,7 @@ function hideEmptyLogPanels() {
 
 function rebindPageControls() {
   try { bindLogsControls(); } catch (_) {}
+  try { bindUsageControls(); } catch (_) {}
   try { hideEmptyLogPanels(); } catch (_) {}
 
   // Re-bind controls after soft navigation content swaps. Idempotent.
@@ -588,7 +592,7 @@ function rebindPageControls() {
           { forceShow: true }
         );
       }
-      toast(r.message || `已启动注册 ×${startedCount}（并发 ${workers}）`);
+      toast(r.message || `已启动注册 ×${startedCount}（线程 ${workers}，同时最多 ${workers} 个）`);
       // Start path auto-saves on server; refresh form from DB shortly after
       setTimeout(() => { loadRegConfig(true).catch(() => {}); }, 300);
       clearInterval(regPollTimer);
@@ -913,6 +917,8 @@ async function loadDashboard() {
     await Promise.resolve(renderKeys());
   } else if (page === "accounts") {
     await Promise.resolve(renderAccounts());
+  } else if (page === "usage") {
+    try { await loadUsage(); } catch (e) { console.warn(e); }
   } else if (page === "logs") {
     try { await loadAdminLogs({ reset: false }); } catch (e) { console.warn(e); }
   } else if (page === "models") {
@@ -935,6 +941,15 @@ async function loadDashboard() {
       pill.textContent = [email, mode, live != null ? ("账号 " + live) : ""].filter(Boolean).join(" · ") || "—";
     }
   } catch (_) {}
+}
+
+function fmtNum(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return "0";
+  if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(2) + "B";
+  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(2) + "M";
+  if (Math.abs(v) >= 1e4) return (v / 1e3).toFixed(1) + "k";
+  return String(Math.round(v));
 }
 
 function renderStats() {
@@ -968,6 +983,8 @@ function renderStats() {
       <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
     <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
       <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
+    <div class="stat"><div class="label">今日用量</div><div class="value mono">${fmtNum((d.usage || s.usage || {}).today_tokens || 0)} token</div>
+      <div class="sub">请求 ${(d.usage || s.usage || {}).today_requests ?? 0} · 累计 ${(d.usage || s.usage || {}).total_tokens ?? 0} token</div></div>
     <div class="stat"><div class="label">Token 自动续期</div><div class="value">${(tm.running || tm.cluster_running || tm.leader_running) ? "运行中" : (tm.enabled === false ? "已关闭" : (tm.enabled ? "已启用" : "未运行"))}</div>
       <div class="sub">最短剩余 ${esc(remLabel)} · 下次 ${nextWait ?? "—"}s${lastRef != null ? ` · 上次刷新 ${lastRef}` : ""}${lastTm.at ? ` · ${fmtTime(lastTm.at)}` : ""}</div></div>
   `;
@@ -2113,7 +2130,7 @@ function readRegConfig() {
     proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
     count: $("reg-count") ? $("reg-count").value.trim() : "1",
     concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "3",
-    stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "400",
+    stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "300",
   };
 }
 // MoeMail official EXPIRY_OPTIONS only:
@@ -2159,7 +2176,7 @@ function applyRegConfig(cfg) {
   if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
   if ($("reg-count")) $("reg-count").value = cfg.count != null ? String(cfg.count) : "1";
   if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency != null ? String(cfg.concurrency) : "3";
-  if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "400";
+  if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms != null ? String(cfg.stagger_ms) : "300";
   regConfigCache = Object.assign({}, cfg);
 }
 
@@ -2241,10 +2258,11 @@ function buildRegBody(config) {
   if (config.proxy_password) body.proxy_password = config.proxy_password;
   const count = Number.parseInt(config.count || "1", 10);
   const concurrency = Number.parseInt(config.concurrency || "3", 10);
-  const stagger = Number.parseInt(config.stagger_ms || "400", 10);
+  const stagger = Number.parseInt(config.stagger_ms || "300", 10);
   if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
-  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, concurrency);
-  if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, stagger);
+  // threads / concurrency: real in-flight registration cap (3 => 3 at a time)
+  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, Math.max(1, Math.floor(concurrency)));
+  if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, Math.floor(stagger));
   return body;
 }
 function buildProxyTestBody(config) {
@@ -3544,6 +3562,286 @@ if ($("btn-refresh-reg")) {
     if (!$(main) && $(alt)) { try { $(alt).id = main; } catch(_){ } }
   });
   
+/* ── Usage / token stats ───────────────────────────── */
+let usageDays = 7;
+let usageLoading = false;
+let usageEventsPage = 1;
+let usageEventsPageSize = 50;
+let usageEventsTotalPages = 1;
+let usageEventsLoading = false;
+let usageEventsLoadSeq = 0;
+
+function bindUsageControls() {
+  on("btn-usage-reload", "onclick", () => loadUsage());
+  const days = $("usage-days");
+  if (days && !days._usageBound) {
+    days._usageBound = true;
+    days.addEventListener("change", () => {
+      usageDays = Number(days.value || 7) || 7;
+      loadUsage();
+    });
+  }
+  bindUsageEventsControls();
+}
+
+function bindUsageEventsControls() {
+  on("btn-usage-events-reload", "onclick", () => loadUsageEvents({ reset: false }));
+  on("btn-usage-events-search", "onclick", () => loadUsageEvents({ reset: true }));
+  on("usage-events-page-prev", "onclick", () => {
+    if (usageEventsPage > 1 && !usageEventsLoading) {
+      usageEventsPage -= 1;
+      loadUsageEvents();
+    }
+  });
+  on("usage-events-page-next", "onclick", () => {
+    if (!usageEventsLoading && usageEventsPage < usageEventsTotalPages) {
+      usageEventsPage += 1;
+      loadUsageEvents();
+    }
+  });
+  const q = $("usage-events-q");
+  if (q && !q._usageEventsBound) {
+    q._usageEventsBound = true;
+    q.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadUsageEvents({ reset: true });
+    });
+  }
+  ["usage-events-protocol", "usage-events-ok", "usage-events-page-size"].forEach((id) => {
+    const el = $(id);
+    if (el && !el._usageEventsBound) {
+      el._usageEventsBound = true;
+      el.addEventListener("change", () => loadUsageEvents({ reset: true }));
+    }
+  });
+  const tb = $("usage-events-tbody");
+  if (tb && !tb._usageEventsBound) {
+    tb._usageEventsBound = true;
+    tb.addEventListener("click", (e) => {
+      const tr = e.target.closest("tr[data-usage-detail]");
+      if (!tr) return;
+      try {
+        const detail = JSON.parse(tr.getAttribute("data-usage-detail") || "{}");
+        const panel = $("usage-events-detail");
+        if (!panel) return;
+        panel.hidden = false;
+        panel.classList.remove("hidden", "is-empty");
+        panel.textContent = JSON.stringify(detail, null, 2);
+      } catch (_) {}
+    });
+  }
+}
+
+async function loadUsageEvents({ reset = false } = {}) {
+  if (!$("usage-events-tbody")) return;
+  bindUsageEventsControls();
+  if (reset) usageEventsPage = 1;
+  usageEventsLoading = true;
+  const seq = ++usageEventsLoadSeq;
+  const q = ($("usage-events-q") && $("usage-events-q").value || "").trim();
+  const protocol = ($("usage-events-protocol") && $("usage-events-protocol").value) || "all";
+  const ok = ($("usage-events-ok") && $("usage-events-ok").value) || "all";
+  usageEventsPageSize = parseInt(($("usage-events-page-size") && $("usage-events-page-size").value) || "50", 10) || 50;
+  $("usage-events-tbody").innerHTML = `<tr><td colspan="11" class="g2a-muted">加载明细中…</td></tr>`;
+  if ($("usage-events-info")) $("usage-events-info").textContent = "查询中…";
+  try {
+    const params = new URLSearchParams({
+      page: String(usageEventsPage),
+      page_size: String(usageEventsPageSize),
+      q,
+      protocol,
+      ok,
+    });
+    const data = await api("/usage/events?" + params.toString());
+    if (seq !== usageEventsLoadSeq) return;
+    const items = (data && data.items) || [];
+    usageEventsPage = Number(data.page || usageEventsPage) || 1;
+    usageEventsTotalPages = Number(data.total_pages || 1) || 1;
+    if ($("usage-events-info")) {
+      $("usage-events-info").textContent =
+        `共 ${fmtNum(data.total || 0)} 条 · 源 ${(data.store_source || "none")}` +
+        (q ? ` · 关键词 “${q}”` : "");
+    }
+    if ($("usage-events-page-info")) {
+      $("usage-events-page-info").textContent =
+        `第 ${usageEventsPage} / ${usageEventsTotalPages} 页`;
+    }
+    if (!items.length) {
+      $("usage-events-tbody").innerHTML =
+        `<tr><td colspan="11" class="g2a-muted">暂无请求明细（新请求完成后会出现在这里）</td></tr>`;
+      return;
+    }
+    $("usage-events-tbody").innerHTML = items.map((it) => {
+      const keyLabel = it.api_key_name
+        ? `${it.api_key_name}${it.api_key_prefix ? " · " + it.api_key_prefix : ""}`
+        : (it.api_key_prefix || it.api_key_id || "—");
+      const protoPath = `${it.protocol || "—"}${it.stream ? " · stream" : ""}\n${it.path || ""}`;
+      const cacheRead = Number(it.cache_read_tokens || 0);
+      const cacheCreate = Number(it.cache_creation_tokens || 0);
+      const cacheTokens = cacheRead + cacheCreate;
+      const cacheParts = [];
+      if (cacheRead > 0) cacheParts.push(`读 ${fmtNum(cacheRead)}`);
+      if (cacheCreate > 0) cacheParts.push(`写 ${fmtNum(cacheCreate)}`);
+      const cacheSub = cacheParts.join(" / ");
+      const reasoningTokens = Number(it.reasoning_tokens || 0);
+      const okPill = it.ok
+        ? '<span class="g2a-tag ok">成功</span>'
+        : '<span class="g2a-tag bad">失败</span>';
+      const detail = {
+        id: it.id,
+        created_at: it.created_at,
+        api_key_id: it.api_key_id,
+        api_key_name: it.api_key_name,
+        api_key_prefix: it.api_key_prefix,
+        account_id: it.account_id,
+        account_email: it.account_email,
+        model: it.model,
+        protocol: it.protocol,
+        path: it.path,
+        stream: it.stream,
+        ok: it.ok,
+        prompt_tokens: it.prompt_tokens,
+        completion_tokens: it.completion_tokens,
+        total_tokens: it.total_tokens,
+        cache_read_tokens: it.cache_read_tokens,
+        cache_creation_tokens: it.cache_creation_tokens,
+        reasoning_tokens: it.reasoning_tokens,
+        client_ip: it.client_ip,
+        user_agent: it.user_agent,
+        status_code: it.status_code,
+        latency_ms: it.latency_ms,
+        error: it.error,
+        detail: it.detail || {},
+      };
+      const detailAttr = esc(JSON.stringify(detail)).replace(/'/g, "&#39;");
+      return `<tr data-usage-detail='${detailAttr}' style="cursor:pointer" title="点击查看完整明细">
+        <td class="mono" style="font-size:12px">${esc(fmtTime(it.created_at))}</td>
+        <td style="font-size:12px;white-space:pre-line">${esc(protoPath)}</td>
+        <td class="mono" style="font-size:12px">${esc(keyLabel)}<div class="g2a-muted" style="font-size:11px">${esc(it.api_key_id || "")}</div></td>
+        <td class="mono" style="font-size:12px">${esc(it.client_ip || "—")}</td>
+        <td class="mono" style="font-size:12px">${esc(it.model || "—")}<div class="g2a-muted" style="font-size:11px">${esc(it.account_email || it.account_id || "")}</div></td>
+        <td class="mono">${fmtNum(it.prompt_tokens)}</td>
+        <td class="mono">${fmtNum(it.completion_tokens)}</td>
+        <td class="mono">${fmtNum(it.total_tokens)}</td>
+        <td class="mono" style="font-size:12px">${cacheTokens > 0 ? fmtNum(cacheTokens) : "—"}${cacheSub ? `<div class="g2a-muted" style="font-size:11px">${esc(cacheSub)}</div>` : ""}</td>
+        <td class="mono">${reasoningTokens > 0 ? fmtNum(reasoningTokens) : "—"}</td>
+        <td>${okPill}</td>
+      </tr>`;
+    }).join("");
+  } catch (e) {
+    if (seq !== usageEventsLoadSeq) return;
+    console.warn("loadUsageEvents", e);
+    $("usage-events-tbody").innerHTML =
+      `<tr><td colspan="11" class="g2a-muted">加载失败：${esc((e && e.message) || e)}</td></tr>`;
+    if ($("usage-events-info")) $("usage-events-info").textContent = "加载失败";
+    toast((e && e.message) || "加载使用明细失败", false);
+  } finally {
+    if (seq === usageEventsLoadSeq) usageEventsLoading = false;
+  }
+}
+
+function renderUsageBars(series) {
+  const host = $("usage-series");
+  if (!host) return;
+  const rows = Array.isArray(series) ? series : [];
+  if (!rows.length) {
+    host.innerHTML = '<div class="g2a-muted">暂无数据</div>';
+    return;
+  }
+  const maxTok = Math.max(1, ...rows.map((r) => Number(r.total_tokens || 0)));
+  host.innerHTML = rows.map((r) => {
+    const tok = Number(r.total_tokens || 0);
+    const req = Number(r.requests || 0);
+    const h = Math.max(4, Math.round((tok / maxTok) * 100));
+    return `<div class="g2a-usage-bar" title="${esc(r.day)} · ${fmtNum(tok)} tok · ${req} 请求">
+      <div class="g2a-usage-bar-fill" style="height:${h}%"></div>
+      <div class="g2a-usage-bar-label">${esc(String(r.day || "").slice(5))}</div>
+      <div class="g2a-usage-bar-val">${fmtNum(tok)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderUsageTable(tbodyId, items, kind) {
+  const tb = $(tbodyId);
+  if (!tb) return;
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    tb.innerHTML = `<tr><td colspan="${kind === "account" ? 6 : 4}" class="g2a-muted">暂无数据</td></tr>`;
+    return;
+  }
+  if (kind === "account") {
+    tb.innerHTML = list.map((it) => {
+      const label = it.email || it.id || "—";
+      const rate = it.success_rate != null ? (it.success_rate + "%") : "—";
+      return `<tr>
+        <td><div class="mono">${esc(label)}</div><div class="g2a-muted" style="font-size:11px">${esc(it.id || "")}</div></td>
+        <td>${fmtNum(it.requests)}</td>
+        <td>${fmtNum(it.success)}</td>
+        <td>${fmtNum(it.fail)}</td>
+        <td class="mono">${fmtNum(it.total_tokens)}</td>
+        <td>${esc(rate)}</td>
+      </tr>`;
+    }).join("");
+    return;
+  }
+  tb.innerHTML = list.map((it) => {
+    const label = kind === "key"
+      ? ((it.name || it.prefix || it.id || "—") + (it.prefix ? ` · ${it.prefix}` : ""))
+      : (it.id || "—");
+    const rate = it.success_rate != null ? (it.success_rate + "%") : "—";
+    return `<tr>
+      <td class="mono">${esc(label)}</td>
+      <td>${fmtNum(it.requests)}</td>
+      <td class="mono">${fmtNum(it.total_tokens)}</td>
+      <td>${esc(rate)}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadUsage() {
+  if (usageLoading) return;
+  usageLoading = true;
+  try {
+    const daysEl = $("usage-days");
+    if (daysEl) usageDays = Number(daysEl.value || usageDays) || 7;
+    const [sum, byKey, byModel, byAcc] = await Promise.all([
+      api("/usage/summary?days=" + encodeURIComponent(usageDays)),
+      api("/usage/by-key?days=" + encodeURIComponent(usageDays) + "&limit=30"),
+      api("/usage/by-model?days=" + encodeURIComponent(usageDays) + "&limit=30"),
+      api("/usage/by-account?days=" + encodeURIComponent(usageDays) + "&limit=30"),
+    ]);
+    const today = (sum && sum.today) || {};
+    const window = (sum && sum.window) || {};
+    const life = (sum && sum.lifetime) || {};
+    const grid = $("usage-stats-grid");
+    if (grid) {
+      grid.innerHTML = `
+        <div class="stat"><div class="label">今日请求</div><div class="value">${fmtNum(today.requests)}</div>
+          <div class="sub">成功 ${fmtNum(today.success)} · 失败 ${fmtNum(today.fail)}${today.success_rate != null ? ` · ${today.success_rate}%` : ""}</div></div>
+        <div class="stat"><div class="label">今日 token</div><div class="value mono">${fmtNum(today.total_tokens)}</div>
+          <div class="sub">输入 ${fmtNum(today.prompt_tokens)} · 输出 ${fmtNum(today.completion_tokens)}</div></div>
+        <div class="stat"><div class="label">近 ${usageDays} 天 token</div><div class="value mono">${fmtNum(window.total_tokens)}</div>
+          <div class="sub">请求 ${fmtNum(window.requests)}${window.success_rate != null ? ` · 成功率 ${window.success_rate}%` : ""}</div></div>
+        <div class="stat"><div class="label">累计 token</div><div class="value mono">${fmtNum(life.total_tokens)}</div>
+          <div class="sub">请求 ${fmtNum(life.requests)} · 源 ${esc((sum && sum.source) || "—")}</div></div>
+      `;
+    }
+    if ($("usage-source")) {
+      $("usage-source").textContent = "数据源: " + ((sum && sum.source) || "none") +
+        " · UTC 日切 · 失败请求不计 token";
+    }
+    renderUsageBars((sum && sum.series) || []);
+    renderUsageTable("usage-by-key-tbody", (byKey && byKey.items) || [], "key");
+    renderUsageTable("usage-by-model-tbody", (byModel && byModel.items) || [], "model");
+    renderUsageTable("usage-by-account-tbody", (byAcc && byAcc.items) || [], "account");
+    try { await loadUsageEvents({ reset: true }); } catch (_) {}
+  } catch (e) {
+    console.warn("loadUsage", e);
+    toast((e && e.message) || "加载用量失败", false);
+  } finally {
+    usageLoading = false;
+  }
+}
+
 /* ── Admin operation logs ───────────────────────────── */
 let logsPage = 1;
 let logsPageSize = 50;

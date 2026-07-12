@@ -1,9 +1,9 @@
 services:
+  # Redis / Postgres are internal-only (no host port publish).
+  # App reaches them via the compose network: redis:6379 / postgres:5432.
   redis:
     image: redis:7-alpine
     container_name: grokcli-2api-redis
-    ports:
-      - "6379:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     restart: unless-stopped
     healthcheck:
@@ -19,8 +19,6 @@ services:
       POSTGRES_USER: grok2api
       POSTGRES_PASSWORD: grok2api
       POSTGRES_DB: grok2api
-    ports:
-      - "5432:5432"
     volumes:
       - grok2api_pg:/var/lib/postgresql/data
     restart: unless-stopped
@@ -51,6 +49,7 @@ services:
       GROK2API_STORE_BACKEND: "hybrid"
       # High-concurrency: multi-worker (override in .env)
       GROK2API_WORKERS: "${GROK2API_WORKERS:-4}"
+      # In-stack service DNS (do not use 127.0.0.1 here)
       REDIS_URL: "redis://redis:6379/0"
       GROK2API_REDIS_URL: "redis://redis:6379/0"
       DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"

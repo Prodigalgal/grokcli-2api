@@ -14,6 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # GHCR / Docker image names must be lowercase
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -22,6 +23,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        run: |
+          set -euo pipefail
+          # github.repository may preserve owner casing (e.g. HM2899/...); Docker requires lowercase
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

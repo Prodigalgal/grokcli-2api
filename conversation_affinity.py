@@ -184,10 +184,17 @@ def conversation_fingerprint(
     user: str | None = None,
     conversation_id: str | None = None,
     api_key_id: str | None = None,
+    prompt_cache_key: str | None = None,
 ) -> str | None:
     """
     Stable id for one multi-turn chat. Same root messages → same fingerprint
     across turns; different chats (or new first user message) → new id.
+
+    Priority for sticky identity:
+      1. conversation_id
+      2. prompt_cache_key (OpenAI / sub2api cache sticky key)
+      3. user + conversation root
+      4. conversation root alone
     """
     if not _enabled():
         return None
@@ -199,6 +206,16 @@ def conversation_fingerprint(
     cid = (conversation_id or "").strip()
     if cid:
         parts.append(f"cid:{cid}")
+        return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+
+    pck = (prompt_cache_key or "").strip()
+    if pck:
+        parts.append(f"pck:{pck}")
+        # Cache key alone is enough for multi-turn stickiness; still fold root
+        # when present so different chats reusing a generic key don't collide.
+        root = _conversation_root(messages)
+        if root:
+            parts.append(f"root:{root}")
         return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
     u = (user or "").strip()
@@ -456,4 +473,54 @@ def extract_conversation_id_from_body(req: Any) -> str | None:
             v = extra.get(key)
             if v and str(v).strip():
                 return str(v).strip()[:200]
+    return None
+
+
+def extract_prompt_cache_key(req: Any) -> str | None:
+    """OpenAI prompt_cache_key (body / metadata / extras / headers-like attrs).
+
+    Used for sticky affinity so multi-turn cache-oriented clients stay on one
+    account even when conversation_id is absent.
+    """
+    if req is None:
+        return None
+
+    def _take(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("null", "none", "undefined"):
+            return None
+        return s[:240]
+
+    for attr in ("prompt_cache_key", "promptCacheKey", "cache_key", "cacheKey"):
+        v = getattr(req, attr, None)
+        if v is None and isinstance(req, dict):
+            v = req.get(attr)
+        got = _take(v)
+        if got:
+            return got
+
+    meta = getattr(req, "metadata", None)
+    if meta is None and isinstance(req, dict):
+        meta = req.get("metadata")
+    if isinstance(meta, dict):
+        for key in (
+            "prompt_cache_key",
+            "promptCacheKey",
+            "cache_key",
+            "cacheKey",
+            "session_id",
+            "sessionId",
+        ):
+            got = _take(meta.get(key))
+            if got:
+                return got
+
+    extra = getattr(req, "model_extra", None)
+    if isinstance(extra, dict):
+        for key in ("prompt_cache_key", "promptCacheKey", "cache_key", "cacheKey"):
+            got = _take(extra.get(key))
+            if got:
+                return got
     return None

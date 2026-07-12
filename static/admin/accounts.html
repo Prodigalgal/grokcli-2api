@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.59cb776403.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.fa8e906253.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -115,6 +115,7 @@
         <a class="g2a-menu-item " href="/admin" data-page="overview"><span class="g2a-menu-ico">◫</span><span>概览</span></a>
         <a class="g2a-menu-item " href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
         <a class="g2a-menu-item is-active" href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
+        <a class="g2a-menu-item " href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
         <a class="g2a-menu-item " href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>日志</span></a>
         <a class="g2a-menu-item " href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
         <a class="g2a-menu-item " href="/admin/settings" data-page="settings"><span class="g2a-menu-ico">⚙</span><span>系统设置</span></a>
@@ -268,8 +269,8 @@
     <div class="g2a-field"><label>前缀</label><input id="reg-prefix" placeholder="可选" /></div>
     <div class="g2a-field"><label>YesCaptcha Key</label><input id="reg-yescaptcha-key" placeholder="..." /></div>
     <div class="g2a-field"><label>数量</label><input id="reg-count" type="number" min="1" value="1" /></div>
-    <div class="g2a-field"><label>并发</label><input id="reg-concurrency" type="number" min="1" value="2" /></div>
-    <div class="g2a-field"><label>间隔 ms</label><input id="reg-stagger-ms" type="number" min="0" value="500" /></div>
+    <div class="g2a-field"><label title="同时注册的线程数：3 就是同时只跑 3 个，完成一个再补一个">线程数</label><input id="reg-concurrency" type="number" min="1" max="10" value="3" /></div>
+    <div class="g2a-field"><label title="同一波线程启动时的错峰间隔（毫秒）">错峰 ms</label><input id="reg-stagger-ms" type="number" min="0" value="300" /></div>
     <div class="g2a-field">
       <label for="reg-expiry-ms">邮箱有效期</label>
       <select id="reg-expiry-ms">
@@ -357,6 +358,6 @@
   <script src="/static/dist/api.6aae993021.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.457ea89640.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.6af43e398e.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.11722294da.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.1b0f3d648f.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

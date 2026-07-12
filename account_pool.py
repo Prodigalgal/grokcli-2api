@@ -1018,9 +1018,16 @@ def report_failure(
     cooldown: float | None = None,
     model: str | None = None,
     headers: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any] | None:
+    """Record a live/request failure and put the account into cooldown.
+
+    Any upstream error during rotation (401/429/5xx/network/proxy) stacks a
+    durable cooldown status so subsequent acquire()/try_acquire_sequence() skip
+    this account. free-usage-exhausted uses the dedicated status stack.
+    Returns a small summary for logs/debug (never raises).
+    """
     if not account_id:
-        return
+        return None
 
     # Read streak before writing so adaptive cooldown can scale.
     state = get_account_pool_state()
@@ -1077,15 +1084,44 @@ def report_failure(
     )
     if free:
         # Still bump fail counters without wiping the free-usage status stack.
+        until = free.get("cooldown_until")
+        try:
+            until_f = float(until) if until is not None else (_now() + 600.0)
+        except (TypeError, ValueError):
+            until_f = _now() + 600.0
         touch_account_stats(
             account_id,
             success=False,
             error=str(free.get("cooldown_reason") or error)[:300],
             consecutive_fails=streak,
             last_status_code=status_code,
+            cooldown_until=until_f,
+            cooldown_sec=float(free.get("cooldown_count") or 1),
             preserve_cooldown=True,
         )
-        return
+        # Multi-worker: always mirror cooldown key so other workers skip immediately.
+        try:
+            from store.pool_redis import set_cooldown
+
+            set_cooldown(account_id, until_f)
+        except Exception:
+            pass
+        print(
+            f"  [pool] live fail → cooldown account={account_id[:48]} "
+            f"code={free.get('cooldown_code')} count={free.get('cooldown_count')} "
+            f"model={model or free.get('cooldown_model') or '-'}",
+            flush=True,
+        )
+        return {
+            "action": "cooldown",
+            "kind": "free_usage",
+            "account_id": account_id,
+            "cooldown_code": free.get("cooldown_code"),
+            "cooldown_count": free.get("cooldown_count"),
+            "cooldown_until": until_f,
+            "kicked": kicked,
+            "soft_blocked": soft_blocked,
+        }
 
     if cooldown is None:
         if kicked:
@@ -1096,7 +1132,7 @@ def report_failure(
                 error=error,
                 consecutive_fails=streak,
                 headers=headers,
-                model_soft_blocked=False,
+                model_soft_blocked=bool(soft_blocked),
             )
     # Non free-usage failures: stack a generic status entry bound to account.
     entry = {
@@ -1130,6 +1166,13 @@ def report_failure(
         )
     except Exception:
         pass
+    # Hot mirror so multi-worker rotation skips this account without waiting for PG lag.
+    try:
+        from store.pool_redis import set_cooldown
+
+        set_cooldown(account_id, until)
+    except Exception:
+        pass
     touch_account_stats(
         account_id,
         success=False,
@@ -1139,6 +1182,23 @@ def report_failure(
         last_status_code=status_code,
         cooldown_sec=float(new_count),
     )
+    print(
+        f"  [pool] live fail → cooldown account={account_id[:48]} "
+        f"code={entry['code']} count={new_count} status={status_code} "
+        f"model={model or '-'} until={int(until)}",
+        flush=True,
+    )
+    return {
+        "action": "cooldown",
+        "kind": "request_fail",
+        "account_id": account_id,
+        "cooldown_code": entry["code"],
+        "cooldown_count": new_count,
+        "cooldown_until": until,
+        "status_code": status_code,
+        "kicked": kicked,
+        "soft_blocked": soft_blocked,
+    }
 
 
 def set_account_enabled(account_id: str, enabled: bool) -> dict[str, Any] | None:

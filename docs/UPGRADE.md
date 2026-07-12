@@ -45,6 +45,7 @@ chmod +x scripts/upgrade_from_file_backend.sh
 
 ```bash
 docker compose up -d redis postgres
+# postgres/redis 默认不映射宿主机端口；迁移容器走 compose 内网服务名
 # 等待 postgres healthy 后：
 docker compose run --rm \
   -e DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api \
@@ -52,7 +53,7 @@ docker compose run --rm \
   python migrate_json_to_pg.py --data-dir /app/data --merge-pool
 ```
 
-本地非 Docker：
+本地非 Docker（需本机已有可连的 Postgres，或临时在 override 里映射端口）：
 
 ```bash
 pip install -r requirements.txt -r requirements-store.txt

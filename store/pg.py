@@ -106,6 +106,61 @@ _SCHEMA_MIGRATIONS = (
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at ON admin_audit_logs (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_action ON admin_audit_logs (action)",
     "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_target ON admin_audit_logs (target_type, target_id)",
+    # Token / request usage daily rollups (proxy-side analytics).
+    """
+    CREATE TABLE IF NOT EXISTS usage_daily (
+      day DATE NOT NULL,
+      dim TEXT NOT NULL,
+      dim_id TEXT NOT NULL DEFAULT '',
+      requests BIGINT NOT NULL DEFAULT 0,
+      success BIGINT NOT NULL DEFAULT 0,
+      fail BIGINT NOT NULL DEFAULT 0,
+      prompt_tokens BIGINT NOT NULL DEFAULT 0,
+      completion_tokens BIGINT NOT NULL DEFAULT 0,
+      total_tokens BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (day, dim, dim_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_usage_daily_dim_day ON usage_daily (dim, day DESC)",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS prompt_tokens_total BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS completion_tokens_total BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS total_tokens_total BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE account_pool ADD COLUMN IF NOT EXISTS prompt_tokens_total BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE account_pool ADD COLUMN IF NOT EXISTS completion_tokens_total BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE account_pool ADD COLUMN IF NOT EXISTS total_tokens_total BIGINT NOT NULL DEFAULT 0",
+    # Per-request usage detail (token breakdown, caller API key, client IP, cache).
+    """
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      api_key_id TEXT,
+      account_id TEXT,
+      model TEXT,
+      protocol TEXT,
+      path TEXT,
+      stream BOOLEAN,
+      ok BOOLEAN NOT NULL DEFAULT true,
+      prompt_tokens BIGINT NOT NULL DEFAULT 0,
+      completion_tokens BIGINT NOT NULL DEFAULT 0,
+      total_tokens BIGINT NOT NULL DEFAULT 0,
+      cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+      cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+      reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+      client_ip TEXT,
+      user_agent TEXT,
+      status_code INT,
+      latency_ms INT,
+      error TEXT,
+      detail JSONB NOT NULL DEFAULT '{}'::jsonb
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_api_key ON usage_events (api_key_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_account ON usage_events (account_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events (model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_protocol ON usage_events (protocol, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_client_ip ON usage_events (client_ip, created_at DESC)",
 )
 
 

@@ -673,6 +673,45 @@ button[disabled] { opacity: .55; cursor: not-allowed; }
 }
 
 
+/* Usage page simple bar chart */
+.g2a-usage-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-height: 140px;
+  padding: 8px 4px 0;
+  overflow-x: auto;
+}
+.g2a-usage-bar {
+  flex: 1 1 0;
+  min-width: 36px;
+  max-width: 72px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  height: 120px;
+  position: relative;
+}
+.g2a-usage-bar-fill {
+  width: 70%;
+  min-height: 4px;
+  border-radius: 6px 6px 2px 2px;
+  background: linear-gradient(180deg, var(--ant-color-primary), color-mix(in srgb, var(--ant-color-primary) 55%, transparent));
+  transition: height .2s ease;
+}
+.g2a-usage-bar-label {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--ant-color-text-secondary, #8b8fa3);
+  font-variant-numeric: tabular-nums;
+}
+.g2a-usage-bar-val {
+  font-size: 10px;
+  color: var(--ant-color-text-tertiary, #6b6f80);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Soft-nav anti-blackout (v1.9.8+) */
 html, body, .g2a-body, .g2a-layout, .g2a-main {
   background: var(--ant-color-bg-base) !important;

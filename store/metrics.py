@@ -15,6 +15,12 @@ _counters: dict[str, float] = {
     "g2a_account_failovers_total": 0,
     "g2a_affinity_hits_total": 0,
     "g2a_affinity_misses_total": 0,
+    "g2a_usage_requests_total": 0,
+    "g2a_usage_success_total": 0,
+    "g2a_usage_fail_total": 0,
+    "g2a_prompt_tokens_total": 0,
+    "g2a_completion_tokens_total": 0,
+    "g2a_total_tokens_total": 0,
 }
 
 

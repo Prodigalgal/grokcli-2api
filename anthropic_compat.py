@@ -9,6 +9,7 @@ can talk to this gateway.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from typing import Any
@@ -461,6 +462,12 @@ def build_openai_chat_body(
     # metadata.user_id → OpenAI user (affinity)
     if isinstance(req.metadata, dict) and req.metadata.get("user_id"):
         body["user"] = str(req.metadata["user_id"])
+    # Surface Anthropic cache markers as OpenAI-style prompt_cache_key so the
+    # shared affinity layer can pin multi-turn chats. Stripped before Grok
+    # upstream (unsupported), but kept through body build intentionally.
+    pck = extract_anthropic_prompt_cache_key(req)
+    if pck:
+        body["prompt_cache_key"] = pck
     # Anthropic thinking → OpenAI reasoning_effort
     effort = _anthropic_thinking_to_reasoning_effort(req.thinking)
     if effort:
@@ -652,6 +659,40 @@ def openai_tool_calls_to_content_blocks(
     return blocks
 
 
+def _anthropic_cache_tokens(usage: dict[str, Any] | None) -> tuple[int, int]:
+    """Return (cache_read, cache_creation) from OpenAI/Anthropic-shaped usage."""
+    if not isinstance(usage, dict):
+        return 0, 0
+    read = 0
+    create = 0
+    for parent in ("prompt_tokens_details", "input_tokens_details"):
+        node = usage.get(parent)
+        if isinstance(node, dict):
+            try:
+                read = max(read, int(node.get("cached_tokens") or 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                create = max(create, int(node.get("cache_creation_tokens") or 0))
+            except (TypeError, ValueError):
+                pass
+    for key in (
+        "cache_read_input_tokens",
+        "cached_tokens",
+        "prompt_cache_hit_tokens",
+    ):
+        try:
+            read = max(read, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            pass
+    for key in ("cache_creation_input_tokens", "cache_creation_tokens"):
+        try:
+            create = max(create, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            pass
+    return max(0, read), max(0, create)
+
+
 def openai_completion_to_anthropic(
     *,
     content: str,
@@ -721,6 +762,8 @@ def openai_completion_to_anthropic(
                 pass
         output_tokens = approx
 
+    cache_read, cache_creation = _anthropic_cache_tokens(usage)
+
     return {
         "id": message_id or f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
@@ -732,6 +775,9 @@ def openai_completion_to_anthropic(
         "usage": {
             "input_tokens": int(input_tokens),
             "output_tokens": int(output_tokens),
+            # Always present so clients can distinguish "0 hit" from "unsupported".
+            "cache_creation_input_tokens": int(cache_creation),
+            "cache_read_input_tokens": int(cache_read),
         },
     }
 
@@ -827,6 +873,8 @@ def anthropic_stream_message_start(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
                 },
             },
         },
@@ -918,11 +966,18 @@ def anthropic_stream_message_delta(
     stop_reason: str,
     output_tokens: int = 0,
     input_tokens: int | None = None,
+    cache_read_input_tokens: int | None = None,
+    cache_creation_input_tokens: int | None = None,
 ) -> str:
     usage: dict[str, Any] = {"output_tokens": int(output_tokens or 0)}
     # Some secondary relays (sub2api) also read input_tokens from message_delta
     if input_tokens is not None:
         usage["input_tokens"] = int(input_tokens or 0)
+    # Always emit cache fields when known (including explicit 0).
+    if cache_read_input_tokens is not None:
+        usage["cache_read_input_tokens"] = int(cache_read_input_tokens or 0)
+    if cache_creation_input_tokens is not None:
+        usage["cache_creation_input_tokens"] = int(cache_creation_input_tokens or 0)
     return _sse_event(
         "message_delta",
         {
@@ -1503,6 +1558,7 @@ class AnthropicStreamAssembler:
         # Prefer real upstream usage (OpenAI prompt/completion tokens)
         out_tok = 0
         in_tok = int(input_tokens or 0)
+        cache_read, cache_creation = _anthropic_cache_tokens(usage)
         if isinstance(usage, dict):
             try:
                 out_tok = int(
@@ -1533,6 +1589,9 @@ class AnthropicStreamAssembler:
                 stop_reason=stop,
                 output_tokens=out_tok,
                 input_tokens=in_tok if in_tok > 0 else None,
+                # Always include (0 ok) so sub2api can see cache support shape.
+                cache_read_input_tokens=cache_read,
+                cache_creation_input_tokens=cache_creation,
             )
         )
         events.append(anthropic_stream_message_stop())
@@ -1555,3 +1614,114 @@ def metadata_user_id(req: AnthropicMessagesRequest) -> str | None:
         if uid:
             return str(uid)
     return None
+
+
+def _cache_control_fingerprint_piece(block: Any) -> str | None:
+    """Stable, short marker from an Anthropic content block's cache_control."""
+    if not isinstance(block, dict):
+        return None
+    cc = block.get("cache_control")
+    if cc is None:
+        return None
+    if isinstance(cc, bool):
+        return "cc:1" if cc else None
+    if isinstance(cc, str) and cc.strip():
+        return f"cc:{cc.strip()[:40]}"
+    if isinstance(cc, dict):
+        ctype = str(cc.get("type") or "ephemeral").strip() or "ephemeral"
+        ttl = cc.get("ttl")
+        if ttl is not None and str(ttl).strip():
+            return f"cc:{ctype}:{str(ttl).strip()[:24]}"
+        return f"cc:{ctype}"
+    return "cc:1"
+
+
+def extract_anthropic_prompt_cache_key(
+    req: AnthropicMessagesRequest | dict[str, Any] | None,
+) -> str | None:
+    """Derive a sticky cache key from Anthropic cache_control / metadata.
+
+    Grok upstream does not honor Anthropic prompt caching, but Claude Code
+    multi-turn still benefits from sticky account routing keyed on the same
+    system/tool cache breakpoints clients mark.
+    """
+    if req is None:
+        return None
+
+    def _meta(obj: Any) -> dict[str, Any] | None:
+        if isinstance(obj, dict):
+            m = obj.get("metadata")
+            return m if isinstance(m, dict) else None
+        m = getattr(obj, "metadata", None)
+        return m if isinstance(m, dict) else None
+
+    meta = _meta(req)
+    if meta:
+        for key in (
+            "prompt_cache_key",
+            "promptCacheKey",
+            "cache_key",
+            "cacheKey",
+            "session_id",
+            "sessionId",
+            "user_id",
+        ):
+            v = meta.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()[:240]
+
+    pieces: list[str] = []
+
+    system = req.get("system") if isinstance(req, dict) else getattr(req, "system", None)
+    if isinstance(system, list):
+        for block in system:
+            mark = _cache_control_fingerprint_piece(block)
+            if mark:
+                text = ""
+                if isinstance(block, dict):
+                    text = str(block.get("text") or "")[:120]
+                pieces.append(f"sys:{mark}:{text}")
+    elif isinstance(system, dict):
+        mark = _cache_control_fingerprint_piece(system)
+        if mark:
+            pieces.append(f"sys:{mark}:{str(system.get('text') or '')[:120]}")
+
+    tools = req.get("tools") if isinstance(req, dict) else getattr(req, "tools", None)
+    if isinstance(tools, list):
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            mark = _cache_control_fingerprint_piece(t)
+            if not mark:
+                continue
+            name = str(t.get("name") or "")[:80]
+            pieces.append(f"tool:{mark}:{name}")
+
+    messages = (
+        req.get("messages") if isinstance(req, dict) else getattr(req, "messages", None)
+    )
+    if isinstance(messages, list):
+        for m in messages[:4]:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                mark = _cache_control_fingerprint_piece(block)
+                if not mark:
+                    continue
+                btype = ""
+                if isinstance(block, dict):
+                    btype = str(block.get("type") or "")[:32]
+                pieces.append(f"msg:{mark}:{btype}")
+                if len(pieces) >= 12:
+                    break
+            if len(pieces) >= 12:
+                break
+
+    if not pieces:
+        return None
+    # Compact deterministic key (not a cryptographic cache, just sticky routing).
+    digest = hashlib.sha256("|".join(pieces).encode("utf-8")).hexdigest()[:32]
+    return f"acc:{digest}"

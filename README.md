@@ -2,9 +2,9 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.9.19（高并发 hybrid）**
+**当前版本：v1.9.22（高并发 hybrid）**
 
-[![GHCR](https://img.shields.io/badge/ghcr.io-HM2899%2Fgrokcli--2api-blue)](https://github.com/HM2899/grokcli-2api/pkgs/container/grokcli-2api)
+[![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
@@ -17,14 +17,14 @@
 ## 架构
 
 ```
-客户端 (OpenAI / Anthropic SDK · new-api · Claude Code)
-        │  /v1/chat/completions  ·  /v1/messages
+客户端 (OpenAI / Anthropic SDK · new-api · Claude Code / sub2api)
+        │  /v1/chat/completions  ·  /v1/responses  ·  /v1/messages
         ▼
   grokcli-2api  (FastAPI · multi-worker)
         │  管理台 /admin
         │  账号轮询 · 失败切换 · 对话粘性
-        │  PostgreSQL（账号 / Key / 设置 / 冷却状态）
-        │  Redis（粘性 / 计数 / 锁 / 会话）
+        │  PostgreSQL（账号 / Key / 设置 / 冷却状态）—— 容器内网，不对外暴露
+        │  Redis（粘性 / 计数 / 锁 / 会话）—— 容器内网，不对外暴露
         ▼
   cli-chat-proxy.grok.com
 ```
@@ -37,26 +37,27 @@
 
 | 功能 | 说明 |
 |------|------|
-| OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · SSE |
+| OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
-| 管理台 | 账号、Key、协议注册、测活、续期、日志、设置 |
+| 管理台 | 账号、Key、协议注册、测活、续期、日志、用量、设置 |
 | 多账号轮询 | `round_robin` / `least_used` / `random` |
 | 冷却状态 | free-usage 等写入 DB；测活成功恢复为「冷却中」→ 正常 |
 | Token 续期 | 后台 leader 维护；支持单选/多选立即续期 |
 | 模型探测 | 单账号 / 多选批量 / 全量；状态实时回填 |
 | 协议注册 | MoeMail + YesCaptcha，多线程批量；入池后延迟测活 |
+| 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；请求明细 |
 
 ---
 
 ## 快速开始
 
-### 方式 A：Docker Compose（源码构建）
+### 方式 A：Docker Compose（推荐）
 
 ```bash
 git clone https://github.com/HM2899/grokcli-2api.git
 cd grokcli-2api
 cp .env.example .env
-# 编辑 .env：GROK2API_ADMIN_PASSWORD、可选注册相关 Key
+# 编辑 .env：至少改 GROK2API_ADMIN_PASSWORD；生产请改 Postgres 密码
 
 docker compose up -d --build
 curl -fsS http://127.0.0.1:3000/health
@@ -64,25 +65,102 @@ curl -fsS http://127.0.0.1:3000/health
 
 浏览器打开：`http://127.0.0.1:3000/admin`
 
-### 方式 B：GHCR 镜像
+**默认只映射应用端口 `3000`。**  
+栈内 **PostgreSQL / Redis 不绑定宿主机端口**，仅通过 compose 内网访问：
 
-```bash
-docker pull ghcr.io/HM2899/grokcli-2api:1.9.19
+| 服务 | 容器内地址 | 是否映射到宿主机 |
+|------|------------|------------------|
+| app | `0.0.0.0:3000` | 是 → `127.0.0.1:3000` |
+| postgres | `postgres:5432` | **否**（内联） |
+| redis | `redis:6379` | **否**（内联） |
+
+因此 compose 里应用环境变量应使用服务名，而不是 `127.0.0.1`：
+
+```env
+REDIS_URL=redis://redis:6379/0
+DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api
 ```
 
-`docker-compose.yml` 中将 app 服务改为：
+> `.env.example` 中的 `127.0.0.1` 仅适用于「本机直接跑 Python、自己起 DB」的场景。  
+> `docker compose` 启动时会用 `docker-compose.yml` 中的服务名覆盖，无需改成宿主机端口。
+
+若你**确实**需要从宿主机连库调试，可在本地 `docker-compose.override.yml` 临时加 `ports`（该文件已 gitignore，勿提交）。
+
+### 方式 B：GHCR 镜像（注意小写）
+
+Docker / GHCR **镜像名必须全小写**。仓库 owner 可能是 `HM2899`，但拉取时要用：
+
+```text
+ghcr.io/hm2899/grokcli-2api
+```
+
+**错误示例（会拉失败）：** `ghcr.io/HM2899/grokcli-2api`  
+**正确示例：**
+
+```bash
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.22
+# 或
+docker pull ghcr.io/hm2899/grokcli-2api:latest
+```
+
+最小 compose 示例（仍建议带上内联 redis + postgres）：
 
 ```yaml
 services:
+  redis:
+    image: redis:7-alpine
+    # 不要 ports —— 仅容器网络内访问
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: grok2api
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: grok2api
+    volumes:
+      - grok2api_pg:/var/lib/postgresql/data
+    # 不要 ports —— 仅容器网络内访问
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   grokcli-2api:
-    image: ghcr.io/HM2899/grokcli-2api:1.9.19
-    # 仍需 redis + postgres 服务，或外部 REDIS_URL / DATABASE_URL
+    image: ghcr.io/hm2899/grokcli-2api:1.9.22
+    ports:
+      - "3000:3000"
+    environment:
+      GROK2API_HOST: "0.0.0.0"
+      GROK2API_PORT: "3000"
+      GROK2API_ADMIN_PASSWORD: "change-me"
+      GROK2API_STORE_BACKEND: "hybrid"
+      GROK2API_REQUIRE_SHARED_STORES: "1"
+      GROK2API_WORKERS: "4"
+      REDIS_URL: "redis://redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:change-me@postgres:5432/grok2api"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  grok2api_pg:
 ```
 
-若包为 private，需先：
+若包为 private，需先登录：
 
 ```bash
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u USERNAME --password-stdin
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
 ```
 
 ### 必要环境变量
@@ -92,8 +170,8 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u USERNAME --password-stdin
 | `GROK2API_ADMIN_PASSWORD` | 管理台密码（首次） |
 | `GROK2API_STORE_BACKEND=hybrid` | 生产模式 |
 | `GROK2API_REQUIRE_SHARED_STORES=1` | Redis/PG 不可用则拒绝启动 |
-| `REDIS_URL` | 如 `redis://redis:6379/0` |
-| `DATABASE_URL` | 如 `postgresql://grok2api:grok2api@postgres:5432/grok2api` |
+| `REDIS_URL` | Compose 内：`redis://redis:6379/0` |
+| `DATABASE_URL` | Compose 内：`postgresql://…@postgres:5432/…` |
 | `GROK2API_WORKERS` | 建议 ≥2（按 CPU） |
 
 完整模板见 [`.env.example`](./.env.example)。**生产请修改默认数据库密码。**
@@ -156,9 +234,10 @@ Claude Code / Cursor / Cherry Studio：Base URL 填服务地址（通常带 `/v1
 
 | 页面 | 用途 |
 |------|------|
-| 概览 | 池规模、续期/探测状态 |
+| 概览 | 池规模、续期/探测状态、今日用量 |
 | 账号 / 轮询 | 导入、设备码、协议注册、测活、续期 |
 | API Keys | 客户端密钥 |
+| 用量 | Token / 请求：今日·近 N 天·累计；Key / 账号 / 模型；请求明细 |
 | 日志 | 登录、账号、Key、探测、设置等记录 |
 | 设置 | 轮询与冷却策略等 |
 
@@ -177,22 +256,25 @@ docker compose logs -f grokcli-2api
 ```
 
 - 仅 **leader** worker 跑 Token 续期与模型健康任务（Redis 选主）
-- 备份重点：**PostgreSQL**；Redis 可丢
+- 备份重点：**PostgreSQL 卷**（`grok2api_pg`）；Redis 可丢
 - 本地低停机重建：`./docker-rebuild.sh`
+- Postgres / Redis **默认不暴露宿主机端口**，降低误扫与误连风险
 
 ### 发布镜像（GHCR）
 
 ```bash
-# app.py 中 APP_VERSION 必须与 tag 一致
-git tag v1.9.19
-git push origin v1.9.19
+# app.py 中 APP_VERSION 必须与 tag 一致（且镜像路径全小写）
+git tag v1.9.22
+git push origin v1.9.22
 ```
 
-成功后可拉取：
+成功后可拉取（**必须小写**）：
 
-- `ghcr.io/HM2899/grokcli-2api:1.9.19`
-- `ghcr.io/HM2899/grokcli-2api:latest`（tag 发布时）
-- `ghcr.io/HM2899/grokcli-2api:edge`（main 分支）
+- `ghcr.io/hm2899/grokcli-2api:1.9.22`
+- `ghcr.io/hm2899/grokcli-2api:latest`（打 `v*` tag 时）
+- `ghcr.io/hm2899/grokcli-2api:edge`（`main` 分支）
+
+CI 会把 `github.repository` 强制转成小写后再推送，避免 `HM2899` 大小写导致 `docker pull` 失败。
 
 ---
 
@@ -207,8 +289,8 @@ scripts/build_admin_assets.py         # 管理台静态资源打包
 docs/UPGRADE.md                       # 升级说明
 static/                               # 管理台前端
 grok-build-auth/                      # 协议注册引擎（vendored）
-docker-compose.yml                    # redis + postgres + app
-.github/workflows/docker-publish.yml  # GHCR 多架构构建
+docker-compose.yml                    # redis + postgres（内网）+ app
+.github/workflows/docker-publish.yml  # GHCR 多架构构建（小写镜像名）
 ```
 
 ---
@@ -217,17 +299,22 @@ docker-compose.yml                    # redis + postgres + app
 
 - 勿将 `.env`、`data/`、真实 Token 提交到 Git
 - 生产务必修改 Postgres 密码与管理员密码
+- 默认不映射 DB/Redis 端口；需要调试时用本地 override，勿对公网暴露
 - 协议注册与账号自动化请遵守 xAI 服务条款与当地法律；本项目仅供自用/研究集成
 
 ---
 
 ## 版本
 
-- **v1.9.19**（当前）：高并发 **hybrid** 默认强制（PostgreSQL + Redis + multi-worker）；管理台静态资源拆分；GHCR 多架构发布；JSON→PG 迁移与升级文档；sub2api / Claude Code 单 tool 出站与 inter-tool gap；移除仓库内临时测试脚本
-- **v1.8.x**：文件后端时代（`data/*.json` 权威存储）；工具流 / history compact 等修复
+- **v1.9.22**（当前）：hybrid 下 **live 账号读取不再依赖本地 `auth.json` 是否存在**（注册只写 PG 时也能进池）；PG 主存不再堆 `auth.bak.*`；compose **取消 Postgres/Redis 宿主机端口绑定**；README 明确 GHCR **小写镜像名**
+- **v1.9.21**：OpenAI **Responses API**（`/v1/responses`）；代理侧 **Token / 请求用量统计**；管理台「用量」页
+- **v1.9.20**：代理侧用量统计初版与管理台用量页
+- **v1.9.19**：高并发 **hybrid** 默认强制（PostgreSQL + Redis + multi-worker）；GHCR 多架构发布；JSON→PG 迁移
+- **v1.8.x**：文件后端时代（`data/*.json` 权威存储）
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.19**）。推 `main` 会打 `edge` 与版本号；打 `v1.9.19` tag 会额外发布 `latest`。
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.22**）。推 `main` 会打 `edge` 与版本号；打 `v1.9.22` tag 会额外发布 `latest`。  
+> 拉取路径固定为 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License
 

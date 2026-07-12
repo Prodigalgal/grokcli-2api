@@ -51,17 +51,18 @@ class GrokCredentials:
 
 
 def _read_auth(path: Path) -> dict[str, Any]:
-    # Prefer locked store for default AUTH_FILE (multi-account safe on Linux)
+    # Prefer locked/PG store for default AUTH_FILE (multi-account safe on Linux).
+    # Hybrid: PostgreSQL is primary; missing local auth.json must NOT block reads.
     if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
         data = read_auth_map(path)
-        if not data and not path.is_file():
-            raise AuthError(
-                f"Auth file not found: {path}. "
-                "Use device-code login or import a token first."
-            )
-        if not data and path.is_file():
-            raise AuthError(f"Unexpected/empty auth.json format in {path}")
-        return data
+        if data:
+            return data
+        if path.is_file():
+            raise AuthError(f"Unexpected/empty auth store (file + DB) for {path}")
+        raise AuthError(
+            "No accounts in durable store. "
+            "Use device-code login, register, or import a token first."
+        )
     if not path.is_file():
         raise AuthError(
             f"Auth file not found: {path}. "
@@ -137,10 +138,14 @@ def list_live_credentials(
     include_expired: bool = False,
     auto_refresh: bool = True,
 ) -> list[GrokCredentials]:
-    """Return all accounts with tokens from auth.json."""
+    """Return all accounts with tokens (PG primary, auth.json mirror/fallback).
+
+    Do not gate on AUTH_FILE existence: hybrid/PG stores accounts in the DB and
+    the local file is only a best-effort mirror. Short-circuiting on missing
+    auth.json made the pool report zero live credentials after register/import
+    wrote only to PostgreSQL.
+    """
     path = path or AUTH_FILE
-    if not path.is_file():
-        return []
     try:
         data = _read_auth(path)
     except AuthError:
