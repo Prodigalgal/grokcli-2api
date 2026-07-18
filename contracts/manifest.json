@@ -2,7 +2,7 @@
   "schema_version": 1,
   "oracle": {
     "implementation": "go",
-    "version": "1.9.92",
+    "version": "2.0.0",
     "note": "Public API is Go; Python remains registration/SSO/captcha sidecars only."
   },
   "routes": [

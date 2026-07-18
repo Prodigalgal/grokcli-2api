@@ -3,7 +3,7 @@
   "$id": "https://grokcli-2api.local/contracts/manifest.schema.json",
   "title": "grokcli-2api compatibility manifest",
   "type": "object",
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "schema_version",
     "oracle",
@@ -144,6 +144,36 @@
         "type": "string",
         "pattern": "^\\$"
       }
+    },
+    "admin_routes": {
+      "type": [
+        "object",
+        "string",
+        "array",
+        "boolean",
+        "number",
+        "null"
+      ]
+    },
+    "readiness": {
+      "type": [
+        "object",
+        "string",
+        "array",
+        "boolean",
+        "number",
+        "null"
+      ]
+    },
+    "data_safety": {
+      "type": [
+        "object",
+        "string",
+        "array",
+        "boolean",
+        "number",
+        "null"
+      ]
     }
   }
 }
