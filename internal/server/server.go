@@ -2093,10 +2093,11 @@ func effectiveResponsesKeepalive(base time.Duration, toolsRequested bool) time.D
 	return base
 }
 
-// responsesKeepaliveFrame is a pure SSE comment plus an OpenAI-compatible ping
-// event so both dumb reverse proxies and Codex-style clients stay warm.
+// responsesKeepaliveFrame uses an SSE comment because Responses clients only
+// accept documented response.* event types. A named response.ping event breaks
+// strict clients such as Grok CLI.
 func responsesKeepaliveFrame() string {
-	return ": keepalive\n\nevent: response.ping\ndata: {\"type\":\"response.ping\"}\n\n"
+	return ": keepalive\n\n"
 }
 
 func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, int, error) {

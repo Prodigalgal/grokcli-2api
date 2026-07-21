@@ -459,6 +459,16 @@ func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 	}
 }
 
+func TestResponsesKeepaliveUsesCommentOnly(t *testing.T) {
+	frame := responsesKeepaliveFrame()
+	if frame != ": keepalive\n\n" {
+		t.Fatalf("keepalive frame = %q", frame)
+	}
+	if strings.Contains(frame, "event:") || strings.Contains(frame, "response.ping") {
+		t.Fatalf("responses keepalive must not emit a named event: %q", frame)
+	}
+}
+
 func TestStreamOpenAIResponsesWritesFunctionCall(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
