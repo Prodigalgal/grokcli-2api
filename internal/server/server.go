@@ -1093,10 +1093,7 @@ func releaseServerPick(options Options, accountID string) {
 }
 
 func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
-	clientCanceled := isClientRequestCanceled(r, cause)
-	if clientCanceled {
-		status = statusClientClosedRequest
-	}
+	ok, status, clientCanceled := normalizeClientCanceledUsage(r, cause, ok, status)
 	usageMap, _ := usage.(map[string]any)
 	// Soft-close / omitted upstream usage: fill from request body so admin does not
 	// show ok=true with all-zero tokens (hollow success with TTFT>0).
@@ -2121,6 +2118,13 @@ func isClientRequestCanceled(r *http.Request, cause error) bool {
 	return r != nil && errors.Is(r.Context().Err(), context.Canceled)
 }
 
+func normalizeClientCanceledUsage(r *http.Request, cause error, ok bool, status int) (bool, int, bool) {
+	if !isClientRequestCanceled(r, cause) {
+		return ok, status, false
+	}
+	return false, statusClientClosedRequest, true
+}
+
 func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
 	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
@@ -2221,10 +2225,7 @@ func bindResponseAffinity(ctx context.Context, options Options, responseID, acco
 }
 
 func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
-	clientCanceled := isClientRequestCanceled(r, cause)
-	if clientCanceled {
-		status = statusClientClosedRequest
-	}
+	ok, status, clientCanceled := normalizeClientCanceledUsage(r, cause, ok, status)
 	usageMap, _ := usage.(map[string]any)
 	// Stream path may already have filled completion from LiveStreamer (fillStreamUsage).
 	// Always re-run fill with request body so prompt/total never stay hollow when ok.

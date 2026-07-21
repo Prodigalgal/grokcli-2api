@@ -506,6 +506,15 @@ func TestClientRequestCanceledDetection(t *testing.T) {
 	if isClientRequestCanceled(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), errors.New("upstream unavailable")) {
 		t.Fatal("upstream error was misclassified as a client cancellation")
 	}
+
+	ok, status, canceled := normalizeClientCanceledUsage(nil, context.Canceled, true, http.StatusOK)
+	if !canceled || ok || status != statusClientClosedRequest {
+		t.Fatalf("canceled usage = ok:%v status:%d canceled:%v", ok, status, canceled)
+	}
+	ok, status, canceled = normalizeClientCanceledUsage(nil, errors.New("upstream unavailable"), true, http.StatusOK)
+	if canceled || !ok || status != http.StatusOK {
+		t.Fatalf("upstream usage = ok:%v status:%d canceled:%v", ok, status, canceled)
+	}
 }
 
 func TestStreamOpenAIResponsesWritesFunctionCall(t *testing.T) {
