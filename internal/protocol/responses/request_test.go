@@ -44,6 +44,11 @@ func TestBuildObjectConvertsChatResult(t *testing.T) {
 	if msg["type"] != "message" || call["type"] != "function_call" || call["call_id"] != "call_1" {
 		t.Fatalf("unexpected output %#v", output)
 	}
+	content := msg["content"].([]any)
+	part := content[0].(map[string]any)
+	if _, ok := part["annotations"].([]any); !ok {
+		t.Fatalf("output text annotations = %#v", part["annotations"])
+	}
 	usage := obj["usage"].(map[string]any)
 	if usage["input_tokens"] != 2 || usage["output_tokens"] != 3 || usage["total_tokens"] != 5 {
 		t.Fatalf("usage = %#v", usage)

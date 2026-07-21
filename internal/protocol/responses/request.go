@@ -292,10 +292,14 @@ func ReasoningEffort(raw map[string]any) string {
 	return reasoning.FromRequestUpstream(raw)
 }
 
+func outputTextPart(text string) map[string]any {
+	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
+}
+
 func BuildObject(responseID, model, content, reasoning string, toolCalls []map[string]any, usage map[string]any, createdAt int64, previous string, metadata map[string]any) map[string]any {
 	output := []any{}
 	if content != "" || len(toolCalls) == 0 {
-		output = append(output, map[string]any{"id": "msg_" + responseID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": content}}})
+		output = append(output, map[string]any{"id": "msg_" + responseID, "type": "message", "role": "assistant", "status": "completed", "content": []any{outputTextPart(content)}})
 	}
 	for i, call := range toolCalls {
 		fn, _ := call["function"].(map[string]any)

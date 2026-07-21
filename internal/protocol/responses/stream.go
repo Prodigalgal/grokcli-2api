@@ -224,7 +224,7 @@ func (s *LiveStreamer) Text(delta string) []string {
 			}),
 			s.sequence.Event("response.content_part.added", map[string]any{
 				"item_id": s.messageID, "output_index": s.output, "content_index": 0,
-				"part": map[string]any{"type": "output_text", "text": ""},
+				"part": outputTextPart(""),
 			}),
 		)
 	}
@@ -881,14 +881,14 @@ func (s *LiveStreamer) Complete(usage *Usage) []string {
 			}),
 			s.sequence.Event("response.content_part.done", map[string]any{
 				"item_id": s.messageID, "output_index": s.textOutputIndex(), "content_index": 0,
-				"part": map[string]any{"type": "output_text", "text": s.text},
+				"part": outputTextPart(s.text),
 			}),
 			s.sequence.Event("response.output_item.done", map[string]any{
 				"output_index": s.textOutputIndex(),
 				"item": map[string]any{
 					"id": s.messageID, "type": "message", "role": "assistant",
 					"status":  "completed",
-					"content": []any{map[string]any{"type": "output_text", "text": s.text}},
+					"content": []any{outputTextPart(s.text)},
 				},
 			}),
 		)
@@ -937,7 +937,7 @@ func (s *LiveStreamer) snapshotOutput() []any {
 	if s.text != "" {
 		pieces = append(pieces, piece{index: s.textOutputIndex(), item: map[string]any{
 			"id": s.messageID, "type": "message", "role": "assistant", "status": "completed",
-			"content": []any{map[string]any{"type": "output_text", "text": s.text}},
+			"content": []any{outputTextPart(s.text)},
 		}})
 	}
 	// Tools by emission index.
