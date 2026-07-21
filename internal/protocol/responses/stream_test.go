@@ -19,6 +19,33 @@ func TestEmptyCompleteCanStillFail(t *testing.T) {
 	}
 }
 
+func TestProgressFrameUsesDocumentedInProgressEvent(t *testing.T) {
+	stream := NewLiveStreamer("resp_progress", "grok", nil)
+	frame := stream.ProgressFrame()
+	if !strings.Contains(frame, "event: response.in_progress") {
+		t.Fatalf("missing response.in_progress event: %q", frame)
+	}
+	if strings.Contains(frame, "response.ping") {
+		t.Fatalf("progress frame must not use response.ping: %q", frame)
+	}
+
+	parts := strings.SplitN(frame, "data: ", 2)
+	if len(parts) != 2 {
+		t.Fatalf("invalid SSE frame %q", frame)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(parts[1])), &payload); err != nil {
+		t.Fatalf("decode progress frame: %v", err)
+	}
+	if payload["type"] != "response.in_progress" {
+		t.Fatalf("type = %#v", payload["type"])
+	}
+	response, ok := payload["response"].(map[string]any)
+	if !ok || response["status"] != "in_progress" || response["object"] != "response" {
+		t.Fatalf("response = %#v", payload["response"])
+	}
+}
+
 func TestToolStreamUsesStableIDsAndMonotonicSequence(t *testing.T) {
 	stream := NewLiveStreamer("resp", "grok", []string{"Edit"})
 	frames := stream.ToolDeltas([]ToolDelta{{

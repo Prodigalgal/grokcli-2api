@@ -459,6 +459,30 @@ func TestStreamOpenAIResponsesWritesSSE(t *testing.T) {
 	}
 }
 
+func TestStreamOpenAIResponsesPendingToolEmitsProgress(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := &slowChunks{
+		chunks: []string{
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]}}]}` + "\n\n",
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n",
+			"data: [DONE]\n\n",
+		},
+		delay: 30 * time.Millisecond,
+	}
+	_, _, err := streamOpenAIResponses(recorder, request, body, "resp_progress", "grok", []string{"Bash"}, 10*time.Millisecond, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := recorder.Body.String()
+	if strings.Count(out, "event: response.in_progress") < 2 {
+		t.Fatalf("pending tool stream did not emit a progress event: %q", out)
+	}
+	if strings.Contains(out, "response.ping") {
+		t.Fatalf("pending tool stream emitted deprecated ping: %q", out)
+	}
+}
+
 func TestResponsesKeepaliveUsesCommentOnly(t *testing.T) {
 	frame := responsesKeepaliveFrame()
 	if frame != ": keepalive\n\n" {
@@ -466,6 +490,21 @@ func TestResponsesKeepaliveUsesCommentOnly(t *testing.T) {
 	}
 	if strings.Contains(frame, "event:") || strings.Contains(frame, "response.ping") {
 		t.Fatalf("responses keepalive must not emit a named event: %q", frame)
+	}
+}
+
+func TestClientRequestCanceledDetection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+	cancel()
+	if !isClientRequestCanceled(request, request.Context().Err()) {
+		t.Fatal("canceled request was not recognized")
+	}
+	if !isClientRequestCanceled(nil, context.Canceled) {
+		t.Fatal("context.Canceled cause was not recognized")
+	}
+	if isClientRequestCanceled(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), errors.New("upstream unavailable")) {
+		t.Fatal("upstream error was misclassified as a client cancellation")
 	}
 }
 

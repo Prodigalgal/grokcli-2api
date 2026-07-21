@@ -80,6 +80,10 @@ type Options struct {
 	RegistrationToken string
 }
 
+// statusClientClosedRequest keeps client-aborted streams distinct from upstream
+// 502 errors in usage records. 499 is the conventional proxy-side status.
+const statusClientClosedRequest = 499
+
 func (o Options) runtimeConfig() config.Config {
 	if o.RuntimeConfig != nil {
 		return *o.RuntimeConfig
@@ -1089,6 +1093,10 @@ func releaseServerPick(options Options, accountID string) {
 }
 
 func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
+	clientCanceled := isClientRequestCanceled(r, cause)
+	if clientCanceled {
+		status = statusClientClosedRequest
+	}
 	usageMap, _ := usage.(map[string]any)
 	// Soft-close / omitted upstream usage: fill from request body so admin does not
 	// show ok=true with all-zero tokens (hollow success with TTFT>0).
@@ -1125,6 +1133,9 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 		ttftPtr = &v
 	}
 	detail := usageDetail("go_chat", requestBody, ttftMS, latency)
+	if clientCanceled {
+		detail["client_canceled"] = true
+	}
 	if ok {
 		flags.apply(detail)
 	}
@@ -1166,6 +1177,9 @@ func recordChatUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord
 
 func reportChatPool(r *http.Request, options Options, accountID string, ok bool, cause error, status int, requestedModel ...string) {
 	if strings.TrimSpace(accountID) == "" {
+		return
+	}
+	if isClientRequestCanceled(r, cause) {
 		return
 	}
 	modelHint := ""
@@ -2100,6 +2114,13 @@ func responsesKeepaliveFrame() string {
 	return ": keepalive\n\n"
 }
 
+func isClientRequestCanceled(r *http.Request, cause error) bool {
+	if errors.Is(cause, context.Canceled) {
+		return true
+	}
+	return r != nil && errors.Is(r.Context().Err(), context.Canceled)
+}
+
 func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reader, responseID, model string, allowed []string, keepalive time.Duration, maxTools int) (map[string]any, int, error) {
 	if _, ok := w.(http.Flusher); !ok {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "streaming is not supported by this response writer"})
@@ -2200,6 +2221,10 @@ func bindResponseAffinity(ctx context.Context, options Options, responseID, acco
 }
 
 func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyRecord, accountID, model string, stream bool, ok bool, status int, started time.Time, usage any, cause error, ttftMS int, requestBody map[string]any) {
+	clientCanceled := isClientRequestCanceled(r, cause)
+	if clientCanceled {
+		status = statusClientClosedRequest
+	}
 	usageMap, _ := usage.(map[string]any)
 	// Stream path may already have filled completion from LiveStreamer (fillStreamUsage).
 	// Always re-run fill with request body so prompt/total never stay hollow when ok.
@@ -2280,6 +2305,9 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 		ttftPtr = &v
 	}
 	detail := map[string]any{"route": "go_responses"}
+	if clientCanceled {
+		detail["client_canceled"] = true
+	}
 	if effort := extractReasoningEffort(requestBody); effort != "" {
 		detail["reasoning_effort"] = effort
 		detail["thinking_intensity"] = effort

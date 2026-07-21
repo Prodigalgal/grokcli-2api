@@ -174,6 +174,19 @@ func (s *LiveStreamer) Start() []string {
 	}
 }
 
+// ProgressFrame emits a documented Responses lifecycle event while a tool call
+// is still accumulating arguments. Unlike an SSE comment, strict clients parse
+// this as activity; unlike a partial function_call, it does not expose invalid
+// tool arguments.
+func (s *LiveStreamer) ProgressFrame() string {
+	if s == nil || s.closed {
+		return ""
+	}
+	return s.sequence.Event("response.in_progress", map[string]any{
+		"response": s.initial(),
+	})
+}
+
 func (s *LiveStreamer) Reasoning(delta string) []string {
 	if s.closed || delta == "" {
 		return nil

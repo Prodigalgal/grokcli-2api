@@ -48,6 +48,12 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 	toolGap := outboundToolGapFrom(r.Context())
 	toolsEmitted := 0
 	kaFrame := responsesKeepaliveFrame()
+	pendingToolProgressFrame := func() string {
+		if frame := streamer.ProgressFrame(); frame != "" {
+			return frame
+		}
+		return kaFrame
+	}
 
 	// pendingText accumulates non-tool frames across tiny upstream deltas so we
 	// do not Flush once per token. Flushed on tools / size / keepalive / end.
@@ -272,9 +278,11 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 			}
 		}
 		// Incomplete tool args: throttle keepalives (not every micro-chunk).
-		// Skip if we already wrote real frames this tick — socket is warm.
+		// Skip if we already wrote real frames this tick. The progress frame is a
+		// documented Responses event, so clients with a first-payload timeout do
+		// not abandon long tool-argument drips.
 		if streamer.HasPendingTools() && !wroteThisTick {
-			return sw.Keepalive(kaFrame, DefaultKeepaliveInterval, true)
+			return sw.Keepalive(pendingToolProgressFrame(), DefaultKeepaliveInterval, true)
 		}
 		return nil
 	}, func() error {
@@ -283,8 +291,11 @@ func runOpenAIResponsesStream(w http.ResponseWriter, r *http.Request, body io.Re
 		select {
 		case <-r.Context().Done():
 			sw.MarkSoftGone()
-			return sw.Keepalive(kaFrame, DefaultKeepaliveInterval, true)
+			return sw.Keepalive(pendingToolProgressFrame(), DefaultKeepaliveInterval, true)
 		default:
+		}
+		if streamer.HasPendingTools() {
+			return sw.Keepalive(pendingToolProgressFrame(), DefaultKeepaliveInterval, false)
 		}
 		return sw.Keepalive(kaFrame, DefaultKeepaliveInterval, false)
 	})
