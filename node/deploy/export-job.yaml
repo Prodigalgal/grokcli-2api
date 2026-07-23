@@ -24,7 +24,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: exporter
-          image: ghcr.io/prodigalgal/grokcli-2api:node-migration-edge
+          image: ghcr.io/prodigalgal/grok2api:node-migration-edge
           args:
             - build/src/cli/export-legacy-postgres-snapshot.js
             - /app/data-node/migration/snapshot.json

@@ -115,13 +115,13 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     reply.code(500).header("cache-control", "no-store").send({ detail: messageFor(error) });
   });
 
-  app.get("/live", async (_request, reply) => reply.header("cache-control", "no-store").send({ ok: true, service: "grokcli-2api-node" }));
+  app.get("/live", async (_request, reply) => reply.header("cache-control", "no-store").send({ ok: true, service: "grok2api" }));
   const readiness = async (_request: FastifyRequest, reply: FastifyReply) => {
     const upstreamConfigured = chatService === null || chatService.isUpstreamConfigured();
     return reply.code(upstreamConfigured ? 200 : 503).header("cache-control", "no-store").send({
       ok: upstreamConfigured,
       ready: upstreamConfigured,
-      service: "grokcli-2api-node",
+      service: "grok2api",
       store: "sqlite",
       ...(upstreamConfigured ? {} : { detail: "direct xAI upstream is not configured" }),
     });

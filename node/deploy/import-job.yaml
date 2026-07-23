@@ -24,7 +24,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: importer
-          image: ghcr.io/prodigalgal/grokcli-2api:node-edge
+          image: ghcr.io/prodigalgal/grok2api:node-edge
           args:
             - build/src/cli/import-legacy-snapshot.js
             - /app/data-node/migration/snapshot.json

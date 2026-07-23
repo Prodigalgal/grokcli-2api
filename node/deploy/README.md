@@ -3,8 +3,8 @@
 These manifests are a cutover template for the existing `grok2api` namespace.
 They are intentionally not wired into the live Argo CD application yet.
 
-1. Let GitHub Actions publish `ghcr.io/prodigalgal/grokcli-2api:node-edge` and
-   `ghcr.io/prodigalgal/grokcli-2api:node-migration-edge`.
+1. Let GitHub Actions publish `ghcr.io/prodigalgal/grok2api:node-edge` and
+   `ghcr.io/prodigalgal/grok2api:node-migration-edge`.
 2. The template explicitly sets `GROK2API_XAI_UPSTREAM_BASE_URL` to the direct
    xAI CLI Responses endpoint `https://cli-chat-proxy.grok.com/v1`; do not
    replace it with a CPA or other relay endpoint.

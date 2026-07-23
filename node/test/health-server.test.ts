@@ -19,7 +19,7 @@ test("health server listens and exposes readiness without caching", async () => 
     assert.deepEqual(await response.json(), {
       ok: true,
       ready: true,
-      service: "grokcli-2api-node",
+      service: "grok2api",
       store: "sqlite",
     });
   } finally {
@@ -52,7 +52,7 @@ test("readiness rejects a Node runtime without an explicit direct xAI upstream",
     assert.deepEqual(await response.json(), {
       ok: false,
       ready: false,
-      service: "grokcli-2api-node",
+      service: "grok2api",
       store: "sqlite",
       detail: "direct xAI upstream is not configured",
     });

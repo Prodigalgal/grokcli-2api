@@ -29,7 +29,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: grok2api
-          image: ghcr.io/prodigalgal/grokcli-2api:node-edge
+          image: ghcr.io/prodigalgal/grok2api:node-edge
           imagePullPolicy: IfNotPresent
           env:
             - name: TZ
