@@ -174,13 +174,26 @@ function sseEvent(name: string, payload: Record<string, unknown>, sequence: numb
   return `event: ${name}\ndata: ${JSON.stringify({ ...payload, type: name, sequence_number: sequence })}\n\n`;
 }
 
+interface ResponseFunctionCall {
+  readonly index: number;
+  readonly id: string;
+  readonly callId: string;
+  name: string;
+  arguments: string;
+  readonly outputIndex: number;
+}
+
 export class ResponsesLiveEncoder {
   private sequence = 0;
   private textOpen = false;
   private reasoningOpen = false;
+  private reasoningOutputIndex: number | null = null;
+  private textOutputIndex: number | null = null;
+  private nextOutputIndex = 0;
   private text = "";
   private reasoning = "";
   private usage: Record<string, unknown> | null = null;
+  private readonly toolCalls = new Map<number, ResponseFunctionCall>();
   private model: string;
 
   constructor(
@@ -218,36 +231,41 @@ export class ResponsesLiveEncoder {
       if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) {
         if (!this.reasoningOpen) {
           this.reasoningOpen = true;
+          this.reasoningOutputIndex = this.nextOutputIndex++;
           frames.push(this.event("response.output_item.added", {
-            output_index: 0,
+            output_index: this.reasoningOutputIndex,
             item: { id: `rs_${this.responseId}`, type: "reasoning", status: "in_progress", summary: [] },
           }));
           frames.push(this.event("response.reasoning_summary_part.added", {
-            item_id: `rs_${this.responseId}`, output_index: 0, summary_index: 0,
+            item_id: `rs_${this.responseId}`, output_index: this.reasoningOutputIndex, summary_index: 0,
             part: { type: "summary_text", text: "" },
           }));
         }
         this.reasoning += delta.reasoning_content;
         frames.push(this.event("response.reasoning_summary_text.delta", {
-          item_id: `rs_${this.responseId}`, output_index: 0, summary_index: 0, delta: delta.reasoning_content,
+          item_id: `rs_${this.responseId}`, output_index: this.reasoningOutputIndex ?? 0, summary_index: 0, delta: delta.reasoning_content,
         }));
       }
       if (typeof delta?.content === "string" && delta.content) {
         if (!this.textOpen) {
           this.textOpen = true;
+          this.textOutputIndex = this.nextOutputIndex++;
           frames.push(this.event("response.output_item.added", {
-            output_index: this.reasoningOpen ? 1 : 0,
+            output_index: this.textOutputIndex,
             item: { id: `msg_${this.responseId}`, type: "message", role: "assistant", status: "in_progress", content: [] },
           }));
           frames.push(this.event("response.content_part.added", {
-            item_id: `msg_${this.responseId}`, output_index: this.reasoningOpen ? 1 : 0, content_index: 0,
+            item_id: `msg_${this.responseId}`, output_index: this.textOutputIndex, content_index: 0,
             part: { type: "output_text", text: "", annotations: [] },
           }));
         }
         this.text += delta.content;
         frames.push(this.event("response.output_text.delta", {
-          item_id: `msg_${this.responseId}`, output_index: this.reasoningOpen ? 1 : 0, content_index: 0, delta: delta.content,
+          item_id: `msg_${this.responseId}`, output_index: this.textOutputIndex ?? 0, content_index: 0, delta: delta.content,
         }));
+      }
+      if (Array.isArray(delta?.tool_calls)) {
+        frames.push(...this.feedToolCalls(delta.tool_calls));
       }
     }
     return frames;
@@ -256,14 +274,21 @@ export class ResponsesLiveEncoder {
   complete(): string[] {
     const frames: string[] = [];
     if (this.reasoningOpen) {
-      frames.push(this.event("response.reasoning_summary_part.done", { item_id: `rs_${this.responseId}`, output_index: 0, summary_index: 0, part: { type: "summary_text", text: this.reasoning } }));
-      frames.push(this.event("response.output_item.done", { output_index: 0, item: { id: `rs_${this.responseId}`, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: this.reasoning }] } }));
+      frames.push(this.event("response.reasoning_summary_part.done", { item_id: `rs_${this.responseId}`, output_index: this.reasoningOutputIndex ?? 0, summary_index: 0, part: { type: "summary_text", text: this.reasoning } }));
+      frames.push(this.event("response.output_item.done", { output_index: this.reasoningOutputIndex ?? 0, item: { id: `rs_${this.responseId}`, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: this.reasoning }] } }));
     }
-    const messageOutputIndex = this.reasoningOpen ? 1 : 0;
     if (this.textOpen) {
-      frames.push(this.event("response.output_text.done", { item_id: `msg_${this.responseId}`, output_index: messageOutputIndex, content_index: 0, text: this.text }));
-      frames.push(this.event("response.content_part.done", { item_id: `msg_${this.responseId}`, output_index: messageOutputIndex, content_index: 0, part: { type: "output_text", text: this.text, annotations: [] } }));
-      frames.push(this.event("response.output_item.done", { output_index: messageOutputIndex, item: { id: `msg_${this.responseId}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: this.text, annotations: [] }] } }));
+      frames.push(this.event("response.output_text.done", { item_id: `msg_${this.responseId}`, output_index: this.textOutputIndex ?? 0, content_index: 0, text: this.text }));
+      frames.push(this.event("response.content_part.done", { item_id: `msg_${this.responseId}`, output_index: this.textOutputIndex ?? 0, content_index: 0, part: { type: "output_text", text: this.text, annotations: [] } }));
+      frames.push(this.event("response.output_item.done", { output_index: this.textOutputIndex ?? 0, item: { id: `msg_${this.responseId}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: this.text, annotations: [] }] } }));
+    }
+    for (const call of this.sortedToolCalls()) {
+      frames.push(this.event("response.function_call_arguments.done", {
+        item_id: call.id, output_index: call.outputIndex, arguments: call.arguments,
+      }));
+      frames.push(this.event("response.output_item.done", {
+        output_index: call.outputIndex, item: this.functionItem(call, "completed"),
+      }));
     }
     frames.push(this.event("response.completed", { response: this.completedObject() }));
     frames.push("data: [DONE]\n\n");
@@ -284,18 +309,23 @@ export class ResponsesLiveEncoder {
   }
 
   private completedObject(): Record<string, unknown> {
-    const output: Record<string, unknown>[] = [];
+    const output: Array<{ readonly index: number; readonly item: Record<string, unknown> }> = [];
     if (this.reasoningOpen) {
-      output.push({ id: `rs_${this.responseId}`, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: this.reasoning }] });
+      output.push({ index: this.reasoningOutputIndex ?? 0, item: { id: `rs_${this.responseId}`, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: this.reasoning }] } });
     }
-    output.push({ id: `msg_${this.responseId}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: this.text, annotations: [] }] });
+    if (this.textOpen || this.toolCalls.size === 0) {
+      output.push({ index: this.textOutputIndex ?? this.nextOutputIndex, item: { id: `msg_${this.responseId}`, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: this.text, annotations: [] }] } });
+    }
+    for (const call of this.sortedToolCalls()) {
+      output.push({ index: call.outputIndex, item: this.functionItem(call, "completed") });
+    }
     const result: Record<string, unknown> = {
       id: this.responseId,
       object: "response",
       created_at: this.createdAt,
       status: "completed",
       model: this.model,
-      output,
+      output: output.sort((left, right) => left.index - right.index).map((entry) => entry.item),
       usage: responseUsage(this.usage),
     };
     if (typeof this.raw.previous_response_id === "string" && this.raw.previous_response_id) {
@@ -311,5 +341,58 @@ export class ResponsesLiveEncoder {
     const output = sseEvent(name, payload, this.sequence);
     this.sequence += 1;
     return output;
+  }
+
+  private feedToolCalls(rawCalls: unknown[]): string[] {
+    const frames: string[] = [];
+    for (const rawCall of rawCalls) {
+      const incoming = object(rawCall);
+      if (!incoming) {
+        continue;
+      }
+      const index = typeof incoming.index === "number" && Number.isInteger(incoming.index) && incoming.index >= 0 ? incoming.index : 0;
+      const functionData = object(incoming.function) ?? {};
+      let call = this.toolCalls.get(index);
+      if (!call) {
+        const callId = typeof incoming.id === "string" && incoming.id ? incoming.id : `call_node_${index}`;
+        call = {
+          index,
+          id: `fc_${this.responseId}_${index}`,
+          callId,
+          name: typeof functionData.name === "string" ? functionData.name : "",
+          arguments: "",
+          outputIndex: this.nextOutputIndex++,
+        };
+        this.toolCalls.set(index, call);
+        frames.push(this.event("response.output_item.added", {
+          output_index: call.outputIndex, item: this.functionItem(call, "in_progress"),
+        }));
+      }
+      if (typeof functionData.name === "string" && functionData.name) {
+        call.name = functionData.name;
+      }
+      if (typeof functionData.arguments === "string" && functionData.arguments) {
+        call.arguments += functionData.arguments;
+        frames.push(this.event("response.function_call_arguments.delta", {
+          item_id: call.id, output_index: call.outputIndex, delta: functionData.arguments,
+        }));
+      }
+    }
+    return frames;
+  }
+
+  private functionItem(call: ResponseFunctionCall, status: "in_progress" | "completed"): Record<string, unknown> {
+    return {
+      id: call.id,
+      type: "function_call",
+      status,
+      call_id: call.callId,
+      name: call.name,
+      arguments: call.arguments,
+    };
+  }
+
+  private sortedToolCalls(): ResponseFunctionCall[] {
+    return [...this.toolCalls.values()].sort((left, right) => left.outputIndex - right.outputIndex);
   }
 }
