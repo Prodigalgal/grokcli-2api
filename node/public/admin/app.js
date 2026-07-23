@@ -64,7 +64,7 @@ async function loadAccounts() {
   $("#accounts-body").innerHTML = data.accounts.map((account) => `<tr>
     <td><strong>${escapeHtml(account.email || account.id)}</strong><br><small>${escapeHtml(account.id)}</small></td>
     <td>${status(account.poolStatus)}</td><td>${account.weight}</td><td>${account.requestCount}</td><td>${date(account.expiresAt)}</td>
-    <td><div class="row-actions"><button type="button" data-account-toggle="${escapeHtml(account.id)}" data-enabled="${account.enabled}">${account.enabled ? "停用" : "启用"}</button><button type="button" data-account-device="${escapeHtml(account.id)}">设备码</button></div></td>
+    <td><div class="row-actions"><button type="button" data-account-toggle="${escapeHtml(account.id)}" data-enabled="${account.enabled}">${account.enabled ? "停用" : "启用"}</button>${account.hasEmailMailbox ? `<button type="button" data-account-email="${escapeHtml(account.id)}">邮箱码</button>` : ""}<button type="button" data-account-device="${escapeHtml(account.id)}">设备码</button></div></td>
   </tr>`).join("") || `<tr><td colspan="6">没有匹配账号</td></tr>`;
   $("#account-pagination").innerHTML = `<button type="button" ${data.page <= 1 ? "disabled" : ""} id="page-prev">上一页</button><span>${data.page || 0} / ${data.totalPages || 0}，共 ${data.total || 0} 个</span><button type="button" ${data.page >= data.totalPages ? "disabled" : ""} id="page-next">下一页</button>`;
   $("#page-prev")?.addEventListener("click", () => { state.accountPage -= 1; void loadAccounts(); });
@@ -74,6 +74,7 @@ async function loadAccounts() {
     await loadAccounts();
   }));
   $$('[data-account-device]').forEach((button) => button.addEventListener("click", () => void startDeviceLogin(button.dataset.accountDevice)));
+  $$('[data-account-email]').forEach((button) => button.addEventListener("click", () => emailLoginDialog(button.dataset.accountEmail)));
 }
 
 async function loadKeys() {
@@ -155,6 +156,14 @@ function browserTaskDialog(title, endpoint) {
   dialog(title, `<label>浏览器工作流 JSON<textarea name="browser" required>{"url":"https://accounts.x.ai/","actions":[]}</textarea></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
     const body = { browser: JSON.parse(String(form.get("browser") || "{}")), idempotency_key: String(form.get("idempotency_key") || "") || undefined };
     await api(endpoint, { method: "POST", body: JSON.stringify(body) });
+  });
+}
+
+function emailLoginDialog(accountId) {
+  dialog("邮箱验证码重登", `<label>浏览器工作流 JSON<textarea name="browser" required>{"url":"https://accounts.x.ai/","actions":[{"type":"fill","selector":"#email","value":"{{account.email}}"}]}</textarea></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
+    const body = { browser: JSON.parse(String(form.get("browser") || "{}")), idempotency_key: String(form.get("idempotency_key") || "") || undefined };
+    await api(`/admin/api/accounts/${encodeURIComponent(accountId)}/email-login`, { method: "POST", body: JSON.stringify(body) });
+    showTab("tasks");
   });
 }
 

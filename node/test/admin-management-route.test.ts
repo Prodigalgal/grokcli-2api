@@ -42,6 +42,7 @@ test("SQLite admin management exposes safe account state and one-time API keys",
     assert.match(accountsText, /member@example\.test/);
     assert.equal(accountsText.includes("private-access-token"), false);
     assert.equal(accountsText.includes("private-refresh-token"), false);
+    assert.match(accountsText, /"hasEmailMailbox":false/);
 
     const disabled = await fetch(`http://127.0.0.1:${port}/admin/api/accounts/account-1/enabled`, {
       method: "PATCH",

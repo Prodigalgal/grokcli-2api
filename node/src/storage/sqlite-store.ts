@@ -36,6 +36,7 @@ export interface AccountSummary {
   readonly failCount: number;
   readonly lastUsedAt: number | null;
   readonly lastError: string | null;
+  readonly hasEmailMailbox: boolean;
   readonly updatedAt: number;
 }
 
@@ -455,6 +456,7 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     `).get(...values) as { total: number }).total;
     const rows = this.db.prepare(`
       SELECT a.id, a.email, a.user_id, a.team_id, a.expires_at, a.updated_at,
+             CASE WHEN instr(a.payload_json, '"registration_mailbox"') > 0 THEN 1 ELSE 0 END AS has_email_mailbox,
              p.enabled, p.disabled_for_quota, p.disabled_reason, p.cooldown_until,
              p.pool_status, p.weight, p.request_count, p.success_count, p.fail_count,
              p.last_used_at, p.last_error
@@ -473,6 +475,7 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
   getAccountSummary(id: string): AccountSummary | null {
     const row = this.db.prepare(`
       SELECT a.id, a.email, a.user_id, a.team_id, a.expires_at, a.updated_at,
+             CASE WHEN instr(a.payload_json, '"registration_mailbox"') > 0 THEN 1 ELSE 0 END AS has_email_mailbox,
              p.enabled, p.disabled_for_quota, p.disabled_reason, p.cooldown_until,
              p.pool_status, p.weight, p.request_count, p.success_count, p.fail_count,
              p.last_used_at, p.last_error
@@ -1234,6 +1237,7 @@ interface AccountSummaryRow {
   readonly team_id: string | null;
   readonly expires_at: number | null;
   readonly updated_at: number;
+  readonly has_email_mailbox: number;
   readonly enabled: number;
   readonly disabled_for_quota: number;
   readonly disabled_reason: string | null;
@@ -1289,6 +1293,7 @@ function accountSummary(row: AccountSummaryRow): AccountSummary {
     failCount: row.fail_count,
     lastUsedAt: row.last_used_at,
     lastError: row.last_error,
+    hasEmailMailbox: row.has_email_mailbox !== 0,
     updatedAt: row.updated_at,
   };
 }
