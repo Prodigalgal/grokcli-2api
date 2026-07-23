@@ -27,7 +27,6 @@ ENV NODE_ENV=production \
     GROK2API_HOST=0.0.0.0 \
     GROK2API_PORT=40081 \
     GROK2API_DATA_DIR=/app/data-node \
-    GROK2API_REQUIRE_API_KEY=auto \
     GROK2API_ACCOUNT_MODE=round_robin
 
 WORKDIR /app
