@@ -22,6 +22,10 @@ export interface AppConfig {
   readonly cfMailBaseUrl: string | null;
   readonly cfMailAdminPassword: string | null;
   readonly cfMailDomain: string | null;
+  readonly registrationProxySubscriptionUrl: string | null;
+  readonly singBoxPath: string;
+  readonly singBoxWorkDir: string;
+  readonly singBoxStartupTimeoutMs: number;
   readonly defaultModel: string;
   readonly legacyApiKey: string | null;
   readonly adminPassword: string | null;
@@ -113,6 +117,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     cfMailBaseUrl: env.GROK2API_CFMAIL_BASE_URL?.trim() || null,
     cfMailAdminPassword: env.GROK2API_CFMAIL_API_KEY?.trim() || null,
     cfMailDomain: env.GROK2API_CFMAIL_DOMAIN?.trim() || null,
+    registrationProxySubscriptionUrl: env.GROK2API_PROXY_SUB_URL?.trim() || null,
+    singBoxPath: resolve(env.GROK2API_SINGBOX_PATH?.trim() || "/opt/sing-box/sing-box"),
+    singBoxWorkDir: resolve(env.GROK2API_SINGBOX_WORK_DIR?.trim() || `${dataDir}/sing-box`),
+    singBoxStartupTimeoutMs: durationSeconds(env, "GROK2API_SINGBOX_STARTUP_TIMEOUT", 15, 3, 60),
     defaultModel: env.GROK2API_DEFAULT_MODEL?.trim() || "grok-4.5",
     legacyApiKey: env.GROK2API_API_KEY?.trim() || null,
     adminPassword: env.GROK2API_ADMIN_PASSWORD?.trim() || null,

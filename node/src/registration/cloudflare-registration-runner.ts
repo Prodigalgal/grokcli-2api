@@ -3,6 +3,7 @@ import {
   type BrowserTaskRunner,
 } from "../automation/browser-task-runner.js";
 import { CloudflareTempMailClient } from "./cloudflare-temp-mail.js";
+import type { RegistrationProxyProvider } from "./sing-box-proxy-manager.js";
 
 export interface SsoRegistrationConverter {
   registerFromSsoCookie(ssoCookie: string, email?: string | null): Promise<{ readonly accountId: string; readonly email: string | null }>;
@@ -22,29 +23,36 @@ export class CloudflareRegistrationTaskRunner implements BrowserTaskRunner {
     private readonly mail: CloudflareTempMailClient,
     private readonly ssoConverter: SsoRegistrationConverter,
     private readonly mailboxStore: CloudflareMailboxCredentialStore,
+    private readonly proxyProvider: RegistrationProxyProvider,
   ) {}
 
   async run(request: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const mailboxInput = mailboxInputFrom(request);
-    const mailbox = await this.mail.createMailbox(mailboxInput);
-    if (!supportsSsoCookieCapture(this.browser)) {
-      throw new Error("registration browser runner cannot capture the authenticated SSO cookie");
+    const proxy = await this.proxyProvider.acquire();
+    try {
+      const mailboxInput = mailboxInputFrom(request);
+      const mailbox = await this.mail.createMailbox(mailboxInput);
+      if (!supportsSsoCookieCapture(this.browser)) {
+        throw new Error("registration browser runner cannot capture the authenticated SSO cookie");
+      }
+      const captured = await this.browser.runWithSsoCookie(request, {
+        variables: {
+          "mailbox.address": mailbox.address,
+          "mailbox.email": mailbox.address,
+        },
+        waitForMailCode: () => this.mail.waitForCode(mailbox),
+        proxyServer: proxy.server,
+      });
+      const account = await this.ssoConverter.registerFromSsoCookie(captured.ssoCookie, mailbox.address);
+      this.mailboxStore.saveCloudflareMailboxCredential(account.accountId, mailbox);
+      return {
+        ...captured.result,
+        accountId: account.accountId,
+        email: account.email ?? mailbox.address,
+        mailProvider: "cloudflare_temp_mail",
+      };
+    } finally {
+      await proxy.release();
     }
-    const captured = await this.browser.runWithSsoCookie(request, {
-      variables: {
-        "mailbox.address": mailbox.address,
-        "mailbox.email": mailbox.address,
-      },
-      waitForMailCode: () => this.mail.waitForCode(mailbox),
-    });
-    const account = await this.ssoConverter.registerFromSsoCookie(captured.ssoCookie, mailbox.address);
-    this.mailboxStore.saveCloudflareMailboxCredential(account.accountId, mailbox);
-    return {
-      ...captured.result,
-      accountId: account.accountId,
-      email: account.email ?? mailbox.address,
-      mailProvider: "cloudflare_temp_mail",
-    };
   }
 }
 

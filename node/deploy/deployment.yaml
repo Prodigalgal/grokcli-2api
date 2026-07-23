@@ -70,6 +70,17 @@ spec:
               value: https://apimail.omnnu.xyz
             - name: GROK2API_CFMAIL_DOMAIN
               value: edu.omnnu.xyz
+            - name: GROK2API_PROXY_SUB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: grok2api-secrets
+                  key: GROK2API_PROXY_SUB_URL
+            - name: GROK2API_SINGBOX_PATH
+              value: /opt/sing-box/sing-box
+            - name: GROK2API_SINGBOX_WORK_DIR
+              value: /app/data-node/sing-box
+            - name: GROK2API_SINGBOX_STARTUP_TIMEOUT
+              value: "15"
             - name: GROK2API_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:

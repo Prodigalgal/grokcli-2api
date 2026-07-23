@@ -11,6 +11,7 @@ import { TokenMaintainer } from "./maintainer/service.js";
 import { CloudflareRegistrationTaskRunner } from "./registration/cloudflare-registration-runner.js";
 import { CloudflareEmailLoginTaskRunner } from "./registration/cloudflare-email-login-runner.js";
 import { CloudflareTempMailClient } from "./registration/cloudflare-temp-mail.js";
+import { SingBoxRegistrationProxyManager } from "./registration/sing-box-proxy-manager.js";
 import { SingleInstanceLock } from "./runtime/single-instance-lock.js";
 import { SqliteStore } from "./storage/sqlite-store.js";
 import { UsageRecorder } from "./usage/recorder.js";
@@ -25,12 +26,20 @@ const maintainer = new TokenMaintainer({ store, config });
 const deviceLogins = new DeviceLoginService({ store, config });
 const ssoReauth = new SsoReauthService({ store, deviceLogins, config });
 const browserRunner = new PlaywrightBrowserTaskRunner();
-const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
+const registrationProxy = config.registrationProxySubscriptionUrl
+  ? new SingBoxRegistrationProxyManager({
+    subscriptionUrl: config.registrationProxySubscriptionUrl,
+    binaryPath: config.singBoxPath,
+    workDir: config.singBoxWorkDir,
+    startupTimeoutMs: config.singBoxStartupTimeoutMs,
+  })
+  : null;
+const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword && registrationProxy
   ? new CloudflareRegistrationTaskRunner(browserRunner, new CloudflareTempMailClient({
     baseUrl: config.cfMailBaseUrl,
     adminPassword: config.cfMailAdminPassword,
     domain: config.cfMailDomain,
-  }), ssoReauth, store)
+  }), ssoReauth, store, registrationProxy)
   : null;
 const emailLoginRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
   ? new CloudflareEmailLoginTaskRunner(browserRunner, new CloudflareTempMailClient({
@@ -70,6 +79,7 @@ async function stop(exitCode: number): Promise<void> {
   try {
     maintainer.stop();
     taskWorker.stop();
+    await registrationProxy?.close();
     usageRecorder.stop();
     await server.close();
   } finally {

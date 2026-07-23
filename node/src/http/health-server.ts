@@ -424,7 +424,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       return reply.code(503).header("cache-control", "no-store").send({ detail: "automation tasks are unavailable" });
     }
     if (kind === "registration" && !registrationAvailable) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "Cloudflare Temp Mail registration is not configured" });
+      return reply.code(503).header("cache-control", "no-store").send({ detail: "registration mail or dedicated proxy is not configured" });
     }
     const body = requestBody(request);
     const browser = body.browser;
@@ -480,7 +480,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     return reply.header("cache-control", "no-store").send({
       ok: registrationAvailable,
       provider: "cloudflare_temp_mail",
-      ...(registrationAvailable ? {} : { detail: "Cloudflare Temp Mail registration is not configured" }),
+      ...(registrationAvailable ? {} : { detail: "registration mail or dedicated proxy is not configured" }),
     });
   });
   app.get("/admin/api/automation/tasks", async (request, reply) => {

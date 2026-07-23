@@ -16,6 +16,7 @@ export interface BrowserSsoCaptureResult {
 export interface BrowserTaskRuntime {
   readonly variables?: Readonly<Record<string, string>>;
   readonly waitForMailCode?: () => Promise<string>;
+  readonly proxyServer?: string;
 }
 
 type BrowserAction =
@@ -47,7 +48,10 @@ export class PlaywrightBrowserTaskRunner implements BrowserTaskRunner {
     captureSso: boolean,
   ): Promise<{ readonly result: Record<string, unknown>; readonly ssoCookie?: string }> {
     const spec = parseSpec(request);
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({
+      headless: true,
+      ...(runtime.proxyServer ? { proxy: { server: runtime.proxyServer } } : {}),
+    });
     try {
       const context = await browser.newContext();
       const page = await context.newPage();
