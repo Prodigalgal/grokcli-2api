@@ -1,4 +1,5 @@
-import { loadConfig } from "../config.js";
+import { dirname, resolve } from "node:path";
+
 import { importLegacySnapshot, loadLegacySnapshot } from "../migration/legacy-snapshot-import.js";
 import { SingleInstanceLock } from "../runtime/single-instance-lock.js";
 import { SqliteStore } from "../storage/sqlite-store.js";
@@ -8,9 +9,10 @@ if (!inputPath) {
   throw new Error("usage: node build/src/cli/import-legacy-snapshot.js <path-to-snapshot.json>");
 }
 
-const config = loadConfig();
-const lock = SingleInstanceLock.acquire(config.dataDir);
-const store = new SqliteStore(config.databasePath);
+const databasePath = resolve(process.env.GROK2API_SQLITE_PATH?.trim() || "./data-node/app.sqlite");
+const dataDir = resolve(process.env.GROK2API_DATA_DIR?.trim() || dirname(databasePath));
+const lock = SingleInstanceLock.acquire(dataDir);
+const store = new SqliteStore(databasePath);
 try {
   store.migrate();
   const report = importLegacySnapshot(store, loadLegacySnapshot(inputPath));

@@ -20,6 +20,7 @@ spec:
         app.kubernetes.io/component: node
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 60
       nodeSelector:
         infra.mnnu/node-class: core-public

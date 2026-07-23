@@ -16,6 +16,7 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
+      enableServiceLinks: false
       nodeSelector:
         infra.mnnu/node-class: core-public
       securityContext:
