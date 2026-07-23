@@ -21,8 +21,10 @@ unit. The target has no Redis and no PostgreSQL:
 - Short-lived routing state and buffered telemetry live in process memory.
 - A bounded Node automation worker keeps SSO conversion, registration,
   device-code login, mailbox handling, and captcha automation recoverable.
-- During the migration only, the existing Python implementation remains a
-  rollback executor. The final target does not require Python.
+- The Node implementation is the default browser executor. Python may remain
+  as an on-demand captcha/Playwright fallback when live anti-automation evidence
+  shows it is necessary, but it never owns API routing, SQLite, task state, or
+  account lifecycle decisions.
 
 This is a deliberate single-active-instance design. It must not be used with
 HPA, more than one replica, or a shared SQLite file across nodes.
@@ -108,6 +110,11 @@ a separate POC. It must pass the real SSO conversion, registration, and
 device-code login suites before it becomes the default for anti-automation
 paths. A package claiming API compatibility is not evidence of equivalent
 fingerprint, proxy, cookie, or captcha behavior.
+
+If those live suites show that the Node adapter is less reliable, the same
+durable task contract may invoke an isolated Python browser executor. That
+executor receives one bounded task, returns only the normalized result, and
+exits; it does not open SQLite, expose a service, or become a second scheduler.
 
 Browser profiles, cookies, and local storage are secrets. Store them under the
 protected data volume, never in the repository, task logs, traces, or admin
@@ -368,8 +375,9 @@ recovery -> cooldown/manual-login path without repeated login storms.
 3. Validate standard Playwright on all three live workflows.
 4. Validate the Camoufox adapter separately on anti-automation-sensitive
    variants. Route by workflow only after evidence supports it.
-5. Keep Python as a rollback executor until all success, failure, cancellation,
-   and restart-recovery cases meet the acceptance window.
+5. Keep Python available as an on-demand browser fallback until all success,
+   failure, cancellation, and restart-recovery cases meet the acceptance
+   window; retain it afterward only if live evidence still justifies it.
 
 Exit gate: registration, SSO conversion, and device login each pass repeated
 live tests and result in accounts that pass an authenticated upstream probe.
@@ -382,9 +390,10 @@ live tests and result in accounts that pass an authenticated upstream probe.
 4. Start the Node target as the only active writer with the browser worker
    disabled initially; verify public read paths and a safe completion canary.
 5. Enable maintenance, then browser automation in small bounded batches.
-6. Keep the old image, PostgreSQL volume, Redis volume, and Python rollback
-   executor for the agreed rollback window. Remove them only after that window
-   and evidence review complete.
+6. Keep the old image, PostgreSQL volume, and Redis volume for the agreed
+   rollback window. A Python browser fallback may remain after that window only
+   as a stateless, on-demand executor. Remove the old API/database runtime only
+   after the evidence review is complete.
 
 ## Rollback
 
@@ -427,7 +436,8 @@ The project is not considered migrated until all of the following are true:
 - Scaling the SQLite deployment beyond one active node.
 - Publishing browser worker, captcha, registration, SSO, or device-login ports.
 - Treating a Node Camoufox package as proof of browser-fingerprint equivalence.
-- Deleting Python before the live browser acceptance gates pass.
+- Forcing captcha or Playwright execution into Node when repeated live evidence
+  shows the isolated Python executor is more reliable.
 - Delaying writes of newly issued credentials to reduce I/O.
 
 ## References
