@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import { supportedSettings } from "./unsupported-integration-settings.js";
-import type { ApiKeySnapshotInput, ModelSnapshotInput, PoolSnapshotInput, SqliteStore } from "../storage/sqlite-store.js";
+import type {
+  ApiKeySnapshotInput,
+  LegacyOperationalHistorySnapshot,
+  ModelSnapshotInput,
+  PoolSnapshotInput,
+  SqliteStore,
+} from "../storage/sqlite-store.js";
 
 export interface LegacySnapshot {
   readonly schema_version: 1;
@@ -13,6 +19,12 @@ export interface LegacySnapshot {
   readonly api_keys?: readonly Record<string, unknown>[];
   readonly models?: readonly Record<string, unknown>[];
   readonly settings?: Record<string, unknown>;
+  readonly history?: {
+    readonly usage_events?: readonly Record<string, unknown>[];
+    readonly usage_daily?: readonly Record<string, unknown>[];
+    readonly task_logs?: readonly Record<string, unknown>[];
+    readonly admin_audit_logs?: readonly Record<string, unknown>[];
+  };
 }
 
 export interface SnapshotImportReport {
@@ -22,6 +34,10 @@ export interface SnapshotImportReport {
   readonly apiKeys: number;
   readonly models: number;
   readonly settings: number;
+  readonly usageEvents: number;
+  readonly usageDaily: number;
+  readonly taskLogs: number;
+  readonly auditLogs: number;
   readonly skippedUnsupportedSettings: number;
   readonly inventorySha256: string;
   readonly credentialsSha256: string;
@@ -36,6 +52,7 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
   const pools = rootPools(snapshot, accounts);
   const apiKeys = (snapshot.api_keys ?? []).map(apiKeyInput);
   const models = (snapshot.models ?? []).map(modelInput);
+  const history = operationalHistory(snapshot);
   const { accepted: settings, skipped: skippedUnsupportedSettings } = supportedSettings(snapshot.settings ?? {});
   const ids = new Set<string>();
   for (const account of accounts) {
@@ -59,6 +76,7 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
     store.replaceApiKeySnapshot(apiKeys);
     store.replaceModelSnapshot(models, now);
     store.replaceSettingsSnapshot(settings, now);
+    store.replaceLegacyOperationalHistory(history);
   });
   const inventory = createHash("sha256");
   const credentials = createHash("sha256");
@@ -80,6 +98,10 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
     apiKeys: apiKeys.length,
     models: models.length,
     settings: Object.keys(settings).length,
+    usageEvents: history.usageEvents.length,
+    usageDaily: history.usageDaily.length,
+    taskLogs: history.records.filter((record) => record.sourceTable === "task_logs").length,
+    auditLogs: history.records.filter((record) => record.sourceTable === "admin_audit_logs").length,
     skippedUnsupportedSettings,
     inventorySha256: inventory.digest("hex"),
     credentialsSha256: credentials.digest("hex"),
@@ -101,8 +123,65 @@ function parseSnapshot(value: unknown): LegacySnapshot {
     ...(root.api_keys === undefined ? {} : { api_keys: records(root.api_keys, "legacy snapshot.api_keys") }),
     ...(root.models === undefined ? {} : { models: records(root.models, "legacy snapshot.models") }),
     ...(root.settings === undefined ? {} : { settings: record(root.settings, "legacy snapshot.settings") }),
+    ...(root.history === undefined ? {} : { history: historyRoot(record(root.history, "legacy snapshot.history")) }),
   };
   return output;
+}
+
+function historyRoot(value: Record<string, unknown>): NonNullable<LegacySnapshot["history"]> {
+  return {
+    ...(value.usage_events === undefined ? {} : { usage_events: records(value.usage_events, "legacy snapshot.history.usage_events") }),
+    ...(value.usage_daily === undefined ? {} : { usage_daily: records(value.usage_daily, "legacy snapshot.history.usage_daily") }),
+    ...(value.task_logs === undefined ? {} : { task_logs: records(value.task_logs, "legacy snapshot.history.task_logs") }),
+    ...(value.admin_audit_logs === undefined ? {} : { admin_audit_logs: records(value.admin_audit_logs, "legacy snapshot.history.admin_audit_logs") }),
+  };
+}
+
+function operationalHistory(snapshot: LegacySnapshot): LegacyOperationalHistorySnapshot {
+  const history = snapshot.history ?? {};
+  const usageEvents = (history.usage_events ?? []).map((value) => {
+    const id = positiveInteger(value.id, "usage event id");
+    return {
+      id,
+      requestId: optionalString(value.request_id ?? value.requestId) ?? `legacy-usage-${id}`,
+      apiKeyId: optionalString(value.api_key_id ?? value.apiKeyId),
+      accountId: optionalString(value.account_id ?? value.accountId),
+      model: optionalString(value.model) ?? "legacy",
+      protocol: optionalString(value.protocol) ?? "legacy",
+      success: booleanValue(value.ok ?? value.success, true),
+      promptTokens: nonNegative(value.prompt_tokens ?? value.promptTokens, 0),
+      completionTokens: nonNegative(value.completion_tokens ?? value.completionTokens, 0),
+      totalTokens: nonNegative(value.total_tokens ?? value.totalTokens, 0),
+      cacheReadTokens: nonNegative(value.cache_read_tokens ?? value.cacheReadTokens, 0),
+      createdAt: requiredEpoch(value.created_at ?? value.createdAt, "usage event created_at"),
+    };
+  });
+  const usageDaily = (history.usage_daily ?? []).map((value) => ({
+    day: requiredDay(value.day),
+    dimension: requiredString(value.dim ?? value.dimension, "usage daily dimension"),
+    dimensionId: optionalString(value.dim_id ?? value.dimension_id ?? value.dimensionId) ?? "",
+    requests: nonNegative(value.requests, 0),
+    success: nonNegative(value.success, 0),
+    fail: nonNegative(value.fail, 0),
+    promptTokens: nonNegative(value.prompt_tokens ?? value.promptTokens, 0),
+    completionTokens: nonNegative(value.completion_tokens ?? value.completionTokens, 0),
+    totalTokens: nonNegative(value.total_tokens ?? value.totalTokens, 0),
+    cacheReadTokens: nonNegative(value.cache_read_tokens ?? value.cacheReadTokens, 0),
+  }));
+  const records = [
+    ...(history.task_logs ?? []).map((value) => legacyHistoryRecord("task_logs", value)),
+    ...(history.admin_audit_logs ?? []).map((value) => legacyHistoryRecord("admin_audit_logs", value)),
+  ];
+  return { usageEvents, usageDaily, records };
+}
+
+function legacyHistoryRecord(sourceTable: "task_logs" | "admin_audit_logs", value: Record<string, unknown>) {
+  return {
+    sourceTable,
+    legacyId: requiredString(value.id, `${sourceTable} id`),
+    createdAt: epoch(value.created_at ?? value.createdAt),
+    payload: value,
+  };
 }
 
 function accountInput(value: Record<string, unknown>) {
@@ -231,6 +310,29 @@ function optionalBoolean(value: unknown): boolean | null {
 function nonNegative(value: unknown, fallback: number): number {
   const parsed = typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : fallback;
   return Math.max(0, parsed);
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${field} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function requiredEpoch(value: unknown, field: string): number {
+  const parsed = epoch(value);
+  if (parsed === null) {
+    throw new Error(`${field} is required`);
+  }
+  return parsed;
+}
+
+function requiredDay(value: unknown): string {
+  const day = requiredString(value, "usage daily day");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error("usage daily day must be YYYY-MM-DD");
+  }
+  return day;
 }
 
 function positiveOrNull(value: unknown): number | null {

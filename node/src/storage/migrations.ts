@@ -200,4 +200,15 @@ export const migrations: readonly Migration[] = [
     );
     CREATE INDEX IF NOT EXISTS idx_usage_daily_dim_day ON usage_daily(dim, day DESC);
   `),
+  migration(6, "legacy_operational_history", `
+    CREATE TABLE IF NOT EXISTS legacy_history (
+      source_table TEXT NOT NULL,
+      legacy_id TEXT NOT NULL,
+      created_at INTEGER,
+      payload_json TEXT NOT NULL,
+      PRIMARY KEY(source_table, legacy_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_legacy_history_source_created
+      ON legacy_history(source_table, created_at DESC);
+  `),
 ];

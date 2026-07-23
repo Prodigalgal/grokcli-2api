@@ -220,16 +220,20 @@ excluded by both tools and reported only as a skipped-setting count.
 
 The Node importer accepts that `schema_version: 1` JSON snapshot through
 `npm run import:legacy-snapshot -- <snapshot.json>`. A full snapshot contains
-`accounts`, optional `account_pool`, `api_keys` (hashes only), `models`, and
-`settings`. It is validated before any write and committed in one SQLite
-transaction. The import report contains only counts plus inventory and
-credential checksums; it never prints credential values, API key material, SSO
-cookies, mailbox credentials, or passwords.
+`accounts`, optional `account_pool`, `api_keys` (hashes only), `models`,
+`settings`, and operational history. Historical usage events and daily
+aggregates are restored into the live SQLite usage tables without changing
+imported API-key totals; task and admin audit records are retained in a
+protected legacy-history table. It is validated before any write and committed
+in one SQLite transaction. The import report contains only counts plus
+inventory and credential checksums; it never prints credential values, API key
+material, SSO cookies, mailbox credentials, or passwords.
 
 The source export must preserve account payloads, pool references, API-key
-SHA-256 hashes, model visibility, and settings values. A pool reference to an
-account missing from the same snapshot is a hard failure. Import rehearsal must
-compare the report counts and checksums with the legacy export before cutover.
+SHA-256 hashes, model visibility, settings values, usage history, and task/audit
+records. A pool reference to an account missing from the same snapshot is a
+hard failure. Import rehearsal must compare the report counts and checksums
+with the legacy export before cutover.
 
 ## Automation Task State Machine
 

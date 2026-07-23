@@ -18,6 +18,10 @@ export interface PostgresSnapshotReport {
   readonly apiKeys: number;
   readonly models: number;
   readonly settings: number;
+  readonly usageEvents: number;
+  readonly usageDaily: number;
+  readonly taskLogs: number;
+  readonly auditLogs: number;
   readonly skippedUnsupportedSettings: number;
   readonly inventorySha256: string;
 }
@@ -28,7 +32,7 @@ export interface PostgresSnapshotExport {
 }
 
 export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSource): Promise<PostgresSnapshotExport> {
-  const [accountsResult, keysResult, modelsResult, settingsResult] = await Promise.all([
+  const [accountsResult, keysResult, modelsResult, settingsResult, usageEventsResult, usageDailyResult, taskLogsResult, auditLogsResult] = await Promise.all([
     source.query<Record<string, unknown>>(`
       SELECT a.id, a.email, a.user_id, a.team_id, a.payload,
              EXTRACT(EPOCH FROM a.expires_at) AS expires_at,
@@ -57,6 +61,30 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
       FROM models ORDER BY sort_order, id
     `),
     source.query<Record<string, unknown>>("SELECT key, value FROM app_settings ORDER BY key"),
+    source.query<Record<string, unknown>>(`
+      SELECT id, request_id, api_key_id, account_id, COALESCE(model, 'legacy') AS model,
+             COALESCE(protocol, 'legacy') AS protocol, ok, prompt_tokens,
+             completion_tokens, total_tokens, cache_read_tokens,
+             EXTRACT(EPOCH FROM created_at) AS created_at
+      FROM usage_events ORDER BY id
+    `),
+    source.query<Record<string, unknown>>(`
+      SELECT day::text AS day, dim, dim_id, requests, success, fail,
+             prompt_tokens, completion_tokens, total_tokens
+      FROM usage_daily ORDER BY day, dim, dim_id
+    `),
+    source.query<Record<string, unknown>>(`
+      SELECT id, EXTRACT(EPOCH FROM created_at) AS created_at,
+             EXTRACT(EPOCH FROM updated_at) AS updated_at,
+             EXTRACT(EPOCH FROM finished_at) AS finished_at,
+             kind, task_id, status, summary, detail, ok, progress_done, progress_total
+      FROM task_logs ORDER BY id
+    `),
+    source.query<Record<string, unknown>>(`
+      SELECT id, EXTRACT(EPOCH FROM created_at) AS created_at, actor, action,
+             target_type, target_id, summary, detail, ip, user_agent, ok
+      FROM admin_audit_logs ORDER BY id
+    `),
   ]);
   const accounts: Record<string, unknown>[] = [];
   const pools: Record<string, unknown>[] = [];
@@ -128,6 +156,35 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
       extra: object(row.extra), sort_order: number(row.sort_order, 100), fetched_at: epoch(row.fetched_at),
     })),
     settings,
+    history: {
+      usage_events: usageEventsResult.rows.map((row) => ({
+        id: positiveInteger(row.id),
+        request_id: nullableText(row.request_id),
+        api_key_id: nullableText(row.api_key_id),
+        account_id: nullableText(row.account_id),
+        model: text(row.model) || "legacy",
+        protocol: text(row.protocol) || "legacy",
+        ok: boolean(row.ok, true),
+        prompt_tokens: number(row.prompt_tokens, 0),
+        completion_tokens: number(row.completion_tokens, 0),
+        total_tokens: number(row.total_tokens, 0),
+        cache_read_tokens: number(row.cache_read_tokens, 0),
+        created_at: epoch(row.created_at),
+      })),
+      usage_daily: usageDailyResult.rows.map((row) => ({
+        day: text(row.day),
+        dim: text(row.dim),
+        dim_id: text(row.dim_id),
+        requests: number(row.requests, 0),
+        success: number(row.success, 0),
+        fail: number(row.fail, 0),
+        prompt_tokens: number(row.prompt_tokens, 0),
+        completion_tokens: number(row.completion_tokens, 0),
+        total_tokens: number(row.total_tokens, 0),
+      })),
+      task_logs: taskLogsResult.rows.map(historyRow),
+      admin_audit_logs: auditLogsResult.rows.map(historyRow),
+    },
   };
   const inventory = createHash("sha256");
   for (const account of accounts) {
@@ -144,6 +201,10 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
       apiKeys: keysResult.rows.length,
       models: modelsResult.rows.length,
       settings: Object.keys(settings).length,
+      usageEvents: usageEventsResult.rows.length,
+      usageDaily: usageDailyResult.rows.length,
+      taskLogs: taskLogsResult.rows.length,
+      auditLogs: auditLogsResult.rows.length,
       skippedUnsupportedSettings,
       inventorySha256: inventory.digest("hex"),
     },
@@ -160,7 +221,10 @@ export function writePrivateSnapshot(path: string, snapshot: Record<string, unkn
 }
 
 function text(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  return typeof value === "number" && Number.isSafeInteger(value) ? String(value) : "";
 }
 
 function nullableText(value: unknown): string | null {
@@ -190,7 +254,29 @@ function jsonValue(value: unknown): unknown {
 }
 
 function number(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && /^-?\d+(?:\.\d+)?$/.test(value.trim())) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function positiveInteger(value: unknown): number {
+  const parsed = number(value, 0);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error("PostgreSQL export encountered an invalid history id");
+  }
+  return parsed;
+}
+
+function historyRow(row: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [
+    key,
+    key.endsWith("_at") ? epoch(value) : value,
+  ]));
 }
 
 function epoch(value: unknown): number | null {

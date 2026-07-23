@@ -82,6 +82,49 @@ class FakePostgresSource implements PostgresSnapshotSource {
         { key: "cliproxyapi_config", value: { url: "https://not-migrated.example.test" } },
       ]);
     }
+    if (sql.includes("FROM usage_events")) {
+      return rows<T>([
+        {
+          id: "7",
+          request_id: null,
+          api_key_id: "key-1",
+          account_id: "account-1",
+          model: "grok-4",
+          protocol: "chat_completions",
+          ok: true,
+          prompt_tokens: "4",
+          completion_tokens: "5",
+          total_tokens: "9",
+          cache_read_tokens: "1",
+          created_at: 1_700_000_020,
+        },
+      ]);
+    }
+    if (sql.includes("FROM usage_daily")) {
+      return rows<T>([
+        {
+          day: "2023-11-14",
+          dim: "global",
+          dim_id: "",
+          requests: "1",
+          success: "1",
+          fail: "0",
+          prompt_tokens: "4",
+          completion_tokens: "5",
+          total_tokens: "9",
+        },
+      ]);
+    }
+    if (sql.includes("FROM task_logs")) {
+      return rows<T>([
+        { id: "3", created_at: 1_700_000_030, updated_at: 1_700_000_031, finished_at: null, kind: "refresh", task_id: "task-1", status: "succeeded", summary: "done", detail: { safe: true }, ok: true, progress_done: 1, progress_total: 1 },
+      ]);
+    }
+    if (sql.includes("FROM admin_audit_logs")) {
+      return rows<T>([
+        { id: "5", created_at: 1_700_000_040, actor: "admin", action: "account.refresh", target_type: "account", target_id: "account-1", summary: "done", detail: { safe: true }, ip: "127.0.0.1", user_agent: "test", ok: true },
+      ]);
+    }
     throw new Error(`unexpected query: ${sql}`);
   }
 }
@@ -98,16 +141,24 @@ test("PostgreSQL exporter creates an importable, secret-silent snapshot", async 
     readonly account_pool: readonly Record<string, unknown>[];
     readonly api_keys: readonly Record<string, unknown>[];
     readonly settings: Record<string, unknown>;
+    readonly history: { usage_events: readonly Record<string, unknown>[]; task_logs: readonly Record<string, unknown>[]; admin_audit_logs: readonly Record<string, unknown>[] };
   };
   assert.equal(snapshot.schema_version, 1);
   assert.equal(exported.report.accounts, 1);
   assert.equal(exported.report.pools, 1);
   assert.equal(exported.report.apiKeys, 1);
+  assert.equal(exported.report.usageEvents, 1);
+  assert.equal(exported.report.usageDaily, 1);
+  assert.equal(exported.report.taskLogs, 1);
+  assert.equal(exported.report.auditLogs, 1);
   assert.equal(exported.report.skippedUnsupportedSettings, 1);
   assert.match(exported.report.inventorySha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(snapshot.account_pool[0]?.extra, { source: "legacy" });
   assert.equal(snapshot.api_keys[0]?.key_hash, "0".repeat(64));
   assert.deepEqual(snapshot.settings, { models_meta: { source: "legacy" } });
+  assert.equal(snapshot.history.usage_events[0]?.request_id, null);
+  assert.equal(snapshot.history.task_logs[0]?.id, "3");
+  assert.equal(snapshot.history.admin_audit_logs[0]?.id, "5");
 });
 
 test("private snapshots are atomically written without emitting their content", () => {

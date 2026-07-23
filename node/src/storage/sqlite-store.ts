@@ -92,6 +92,54 @@ export interface UsageEventInput {
   readonly createdAt?: number;
 }
 
+export interface LegacyUsageEventInput {
+  readonly id: number;
+  readonly requestId: string;
+  readonly apiKeyId?: string | null;
+  readonly accountId?: string | null;
+  readonly model: string;
+  readonly protocol: string;
+  readonly success: boolean;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
+  readonly totalTokens?: number;
+  readonly cacheReadTokens?: number;
+  readonly createdAt: number;
+}
+
+export interface LegacyUsageDailyInput {
+  readonly day: string;
+  readonly dimension: string;
+  readonly dimensionId?: string;
+  readonly requests?: number;
+  readonly success?: number;
+  readonly fail?: number;
+  readonly promptTokens?: number;
+  readonly completionTokens?: number;
+  readonly totalTokens?: number;
+  readonly cacheReadTokens?: number;
+}
+
+export interface LegacyHistoryInput {
+  readonly sourceTable: "task_logs" | "admin_audit_logs";
+  readonly legacyId: string;
+  readonly createdAt?: number | null;
+  readonly payload: Record<string, unknown>;
+}
+
+export interface LegacyOperationalHistorySnapshot {
+  readonly usageEvents: readonly LegacyUsageEventInput[];
+  readonly usageDaily: readonly LegacyUsageDailyInput[];
+  readonly records: readonly LegacyHistoryInput[];
+}
+
+export interface LegacyOperationalHistoryCounts {
+  readonly usageEvents: number;
+  readonly usageDaily: number;
+  readonly taskLogs: number;
+  readonly auditLogs: number;
+}
+
 export interface UsageSummary {
   readonly today: UsageTotals;
   readonly total: UsageTotals;
@@ -882,6 +930,95 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
   getSetting(key: string): unknown | null {
     const row = this.db.prepare("SELECT value_json FROM app_settings WHERE key = ?").get(key) as { value_json: string } | undefined;
     return row ? JSON.parse(row.value_json) as unknown : null;
+  }
+
+  replaceLegacyOperationalHistory(snapshot: LegacyOperationalHistorySnapshot): void {
+    this.transaction(() => {
+      this.db.prepare("DELETE FROM usage_events").run();
+      this.db.prepare("DELETE FROM usage_daily").run();
+      this.db.prepare("DELETE FROM legacy_history").run();
+      const usageEvent = this.db.prepare(`
+        INSERT INTO usage_events(
+          id, request_id, api_key_id, account_id, model, protocol, success,
+          prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const event of snapshot.usageEvents) {
+        if (!Number.isSafeInteger(event.id) || event.id <= 0 || !event.requestId.trim() || !event.model.trim() || !event.protocol.trim()) {
+          throw new Error("legacy usage event contains invalid identity fields");
+        }
+        if (!Number.isSafeInteger(event.createdAt) || event.createdAt <= 0) {
+          throw new Error("legacy usage event createdAt is invalid");
+        }
+        const promptTokens = nonNegativeInteger(event.promptTokens);
+        const completionTokens = nonNegativeInteger(event.completionTokens);
+        usageEvent.run(
+          event.id,
+          event.requestId.trim(),
+          event.apiKeyId?.trim() || null,
+          event.accountId?.trim() || null,
+          event.model.trim(),
+          event.protocol.trim(),
+          event.success ? 1 : 0,
+          promptTokens,
+          completionTokens,
+          Math.max(nonNegativeInteger(event.totalTokens), promptTokens + completionTokens),
+          Math.min(nonNegativeInteger(event.cacheReadTokens), promptTokens),
+          event.createdAt,
+        );
+      }
+      const usageDaily = this.db.prepare(`
+        INSERT INTO usage_daily(
+          day, dim, dim_id, requests, success, fail, prompt_tokens,
+          completion_tokens, total_tokens, cache_read_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const daily of snapshot.usageDaily) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(daily.day) || !daily.dimension.trim()) {
+          throw new Error("legacy usage daily row contains invalid dimensions");
+        }
+        usageDaily.run(
+          daily.day,
+          daily.dimension.trim(),
+          daily.dimensionId?.trim() || "",
+          nonNegativeInteger(daily.requests),
+          nonNegativeInteger(daily.success),
+          nonNegativeInteger(daily.fail),
+          nonNegativeInteger(daily.promptTokens),
+          nonNegativeInteger(daily.completionTokens),
+          nonNegativeInteger(daily.totalTokens),
+          nonNegativeInteger(daily.cacheReadTokens),
+        );
+      }
+      const history = this.db.prepare(`
+        INSERT INTO legacy_history(source_table, legacy_id, created_at, payload_json)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const record of snapshot.records) {
+        if (!record.legacyId.trim()) {
+          throw new Error("legacy history record id is required");
+        }
+        history.run(
+          record.sourceTable,
+          record.legacyId.trim(),
+          record.createdAt ?? null,
+          JSON.stringify(record.payload),
+        );
+      }
+    });
+  }
+
+  legacyOperationalHistoryCounts(): LegacyOperationalHistoryCounts {
+    const count = (sql: string, ...parameters: string[]): number => {
+      const row = this.db.prepare(sql).get(...parameters) as { total: number };
+      return row.total;
+    };
+    return {
+      usageEvents: count("SELECT COUNT(*) AS total FROM usage_events"),
+      usageDaily: count("SELECT COUNT(*) AS total FROM usage_daily"),
+      taskLogs: count("SELECT COUNT(*) AS total FROM legacy_history WHERE source_table = ?", "task_logs"),
+      auditLogs: count("SELECT COUNT(*) AS total FROM legacy_history WHERE source_table = ?", "admin_audit_logs"),
+    };
   }
 
   recordUsageBatch(events: readonly UsageEventInput[]): number {

@@ -16,7 +16,7 @@ function createStore(): { readonly store: SqliteStore; readonly dir: string } {
 test("SQLite migrations and account writes are durable", () => {
   const { store, dir } = createStore();
   try {
-    assert.deepEqual(store.listAppliedMigrations(), [1, 2, 3, 4, 5]);
+    assert.deepEqual(store.listAppliedMigrations(), [1, 2, 3, 4, 5, 6]);
     const first = store.saveAccount({
       id: "account-1",
       email: "user@example.test",

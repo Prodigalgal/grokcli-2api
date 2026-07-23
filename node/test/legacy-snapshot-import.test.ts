@@ -63,12 +63,45 @@ test("legacy snapshot imports account pool, API key hashes, models, and settings
         models_meta: { source: "snapshot" },
         sub2api_config: { url: "https://not-migrated.example.test" },
       },
+      history: {
+        usage_events: [{
+          id: 7,
+          request_id: null,
+          api_key_id: "key-1",
+          account_id: "account-1",
+          model: "grok-4.5",
+          protocol: "chat_completions",
+          ok: true,
+          prompt_tokens: 4,
+          completion_tokens: 5,
+          total_tokens: 9,
+          cache_read_tokens: 1,
+          created_at: 1_700_000_000,
+        }],
+        usage_daily: [{
+          day: "2023-11-14",
+          dim: "global",
+          dim_id: "",
+          requests: 1,
+          success: 1,
+          fail: 0,
+          prompt_tokens: 4,
+          completion_tokens: 5,
+          total_tokens: 9,
+        }],
+        task_logs: [{ id: "task-log-1", created_at: 1_700_000_000, kind: "refresh", status: "succeeded", detail: { safe: true } }],
+        admin_audit_logs: [{ id: "audit-log-1", created_at: 1_700_000_000, action: "account.refresh", detail: { safe: true } }],
+      },
     };
     const report = importLegacySnapshot(store, snapshot, 1_700_000_001_000);
     assert.equal(report.accounts, 1);
     assert.equal(report.pools, 1);
     assert.equal(report.apiKeys, 1);
     assert.equal(report.models, 1);
+    assert.equal(report.usageEvents, 1);
+    assert.equal(report.usageDaily, 1);
+    assert.equal(report.taskLogs, 1);
+    assert.equal(report.auditLogs, 1);
     assert.equal(report.skippedUnsupportedSettings, 1);
     assert.equal(store.getAccount("account-1")?.email, "member@example.test");
     assert.equal(store.listPoolCandidates().length, 1);
@@ -77,6 +110,7 @@ test("legacy snapshot imports account pool, API key hashes, models, and settings
     assert.equal(store.listPublicModels()[0]?.id, "grok-4.5");
     assert.deepEqual(store.getSetting("registration_config"), { mail_provider: "cfmail" });
     assert.equal(store.getSetting("sub2api_config"), null);
+    assert.deepEqual(store.legacyOperationalHistoryCounts(), { usageEvents: 1, usageDaily: 1, taskLogs: 1, auditLogs: 1 });
     assert.match(report.inventorySha256, /^[a-f0-9]{64}$/);
     assert.match(report.credentialsSha256, /^[a-f0-9]{64}$/);
   } finally {
