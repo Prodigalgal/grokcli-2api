@@ -33,6 +33,10 @@ docker-rebuild.local.sh
 # release pin tracked for CI version gate
 # .release-commit
 
+# TypeScript/Node migration runtime
+node/node_modules/
+node/build/
+
 # Built Go binaries (source lives under cmd/; do not ignore grok2api/ package dir)
 /grok2api-migrate
 /grok2api/grok2api

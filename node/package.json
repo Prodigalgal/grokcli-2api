@@ -1,0 +1,27 @@
+{
+  "name": "grokcli-2api-node",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0 <23"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "start": "node build/src/main.js",
+    "import:legacy-auth": "npm run build && node build/src/cli/import-legacy-auth.js",
+    "import:legacy-snapshot": "npm run build && node build/src/cli/import-legacy-snapshot.js",
+    "export:legacy-snapshot": "npm run build && node build/src/cli/export-legacy-postgres-snapshot.js",
+    "test": "npm run build && node --test build/test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
+    "pg": "^8.22.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "fastify": "^5.10.0",
+    "playwright": "^1.61.1"
+  }
+}

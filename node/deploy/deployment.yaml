@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grok2api
+  labels:
+    app.kubernetes.io/name: grok2api
+    app.kubernetes.io/component: node
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grok2api
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grok2api
+        app.kubernetes.io/component: node
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        infra.mnnu/node-class: core-public
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: grok2api
+          image: ghcr.io/prodigalgal/grokcli-2api:node-edge
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: GROK2API_HOST
+              value: 0.0.0.0
+            - name: GROK2API_PORT
+              value: "3000"
+            - name: GROK2API_DATA_DIR
+              value: /app/data-node
+            - name: GROK2API_SQLITE_PATH
+              value: /app/data-node/app.sqlite
+            - name: GROK2API_DEFAULT_MODEL
+              value: grok-4.5
+            - name: GROK2API_ACCOUNT_MODE
+              value: round_robin
+            - name: GROK2API_REQUIRE_API_KEY
+              value: auto
+            - name: GROK2API_TOKEN_MAINTAIN
+              value: "1"
+            - name: GROK2API_TOKEN_MAINTAIN_INTERVAL
+              value: "60"
+            - name: GROK2API_TOKEN_REFRESH_BATCH
+              value: "20"
+            - name: GROK2API_TOKEN_REFRESH_WORKERS
+              value: "2"
+            - name: GROK2API_TOKEN_REFRESH_SKEW
+              value: "180"
+            - name: GROK2API_SSO_REAUTH_COOLDOWN
+              value: "3600"
+            - name: GROK2API_USAGE_FLUSH_INTERVAL
+              value: "15"
+            - name: GROK2API_USAGE_FLUSH_BATCH
+              value: "100"
+            - name: GROK2API_CFMAIL_BASE_URL
+              value: https://apimail.omnnu.xyz
+            - name: GROK2API_CFMAIL_DOMAIN
+              value: edu.omnnu.xyz
+            - name: GROK2API_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grok2api-secrets
+                  key: GROK2API_ADMIN_PASSWORD
+            - name: GROK2API_CFMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: grok2api-secrets
+                  key: GROK2API_CFMAIL_API_KEY
+            - name: GROK2API_XAI_UPSTREAM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: grok2api-secrets
+                  key: GROK2API_XAI_UPSTREAM_BASE_URL
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /app/data-node
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: grok2api-node-data
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi

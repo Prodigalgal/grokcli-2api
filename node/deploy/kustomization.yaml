@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: grok2api
+resources:
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - import-job.yaml
+images:
+  - name: ghcr.io/prodigalgal/grokcli-2api
+    newName: ghcr.io/prodigalgal/grokcli-2api
+    newTag: node-edge
