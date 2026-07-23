@@ -48,6 +48,8 @@ spec:
               value: round_robin
             - name: GROK2API_REQUIRE_API_KEY
               value: auto
+            - name: GROK2API_AUTOMATION_WORKER
+              value: "1"
             - name: GROK2API_TOKEN_MAINTAIN
               value: "1"
             - name: GROK2API_TOKEN_MAINTAIN_INTERVAL

@@ -6,6 +6,7 @@ export interface AppConfig {
   readonly dataDir: string;
   readonly databasePath: string;
   readonly workerLeaseMs: number;
+  readonly automationWorkerEnabled: boolean;
   readonly tokenMaintainerEnabled: boolean;
   readonly tokenMaintainerIntervalMs: number;
   readonly tokenRefreshBatch: number;
@@ -96,6 +97,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     dataDir,
     databasePath,
     workerLeaseMs: integer(env, "GROK2API_WORKER_LEASE_MS", 120_000, 5_000, 3_600_000),
+    automationWorkerEnabled: boolean(env, "GROK2API_AUTOMATION_WORKER", true),
     tokenMaintainerEnabled: boolean(env, "GROK2API_TOKEN_MAINTAIN", true),
     tokenMaintainerIntervalMs: durationSeconds(env, "GROK2API_TOKEN_MAINTAIN_INTERVAL", 60, 5, 1_800),
     tokenRefreshBatch: integer(env, "GROK2API_TOKEN_REFRESH_BATCH", 40, 1, 500),

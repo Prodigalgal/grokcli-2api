@@ -56,7 +56,7 @@ const server = createApiServer({
   chatService: new ChatService(store, config.upstreamBase, config.defaultModel, config.poolMode, usageRecorder),
   deviceLogins,
   automationTasks: store.automationTasks(),
-  registrationAvailable: registrationRunner !== null,
+  registrationAvailable: config.automationWorkerEnabled && registrationRunner !== null,
   adminStore: store,
   adminPassword: config.adminPassword,
 });
@@ -86,7 +86,16 @@ await server.listen(config.host, config.port);
 if (config.tokenMaintainerEnabled) {
   maintainer.start();
 }
-deviceLogins.resume();
-taskWorker.start();
+if (config.automationWorkerEnabled) {
+  deviceLogins.resume();
+  taskWorker.start();
+}
 usageRecorder.start();
-console.info(JSON.stringify({ event: "node_runtime_started", host: config.host, port: config.port, store: "sqlite" }));
+console.info(JSON.stringify({
+  event: "node_runtime_started",
+  host: config.host,
+  port: config.port,
+  store: "sqlite",
+  automationWorker: config.automationWorkerEnabled,
+  tokenMaintainer: config.tokenMaintainerEnabled,
+}));

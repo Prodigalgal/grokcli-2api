@@ -18,3 +18,8 @@ test("Node runtime requires an explicit direct xAI upstream and uses only Cloudf
   const direct = loadConfig({ GROK2API_XAI_UPSTREAM_BASE_URL: "https://direct-xai.example.test/v1/" });
   assert.equal(direct.upstreamBase, "https://direct-xai.example.test/v1");
 });
+
+test("automation worker is enabled by default and can be disabled for a shadow runtime", () => {
+  assert.equal(loadConfig({}).automationWorkerEnabled, true);
+  assert.equal(loadConfig({ GROK2API_AUTOMATION_WORKER: "0" }).automationWorkerEnabled, false);
+});
