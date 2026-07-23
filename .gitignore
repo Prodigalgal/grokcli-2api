@@ -71,3 +71,4 @@ install_*_en.sh
 scripts/release_v*.sh
 scripts/_fetch_*.py
 /tmp/
+.playwright-cli/
