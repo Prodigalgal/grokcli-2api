@@ -27,6 +27,9 @@ export interface AppConfig {
   readonly singBoxWorkDir: string;
   readonly singBoxStartupTimeoutMs: number;
   readonly registrationProxyTlsInsecure: boolean;
+  readonly registrationServiceUrl: string | null;
+  readonly registrationServiceToken: string | null;
+  readonly registrationTimeoutMs: number;
   readonly defaultModel: string;
   readonly legacyApiKey: string | null;
   readonly adminPassword: string | null;
@@ -123,6 +126,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     singBoxWorkDir: resolve(env.GROK2API_SINGBOX_WORK_DIR?.trim() || `${dataDir}/sing-box`),
     singBoxStartupTimeoutMs: durationSeconds(env, "GROK2API_SINGBOX_STARTUP_TIMEOUT", 15, 3, 60),
     registrationProxyTlsInsecure: boolean(env, "GROK2API_PROXY_TLS_INSECURE", false),
+    registrationServiceUrl: env.GROK2API_REGISTRATION_SERVICE_URL?.trim().replace(/\/+$/, "") || null,
+    registrationServiceToken: env.GROK2API_REGISTRATION_TOKEN?.trim() || null,
+    registrationTimeoutMs: durationSeconds(env, "GROK2API_REGISTRATION_TIMEOUT", 600, 60, 1_800),
     defaultModel: env.GROK2API_DEFAULT_MODEL?.trim() || "grok-4.5",
     legacyApiKey: env.GROK2API_API_KEY?.trim() || null,
     adminPassword: env.GROK2API_ADMIN_PASSWORD?.trim() || null,

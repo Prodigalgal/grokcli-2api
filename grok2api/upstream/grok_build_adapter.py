@@ -3507,6 +3507,35 @@ def _run_registration(
                 "visible to CreateSession."
             )
 
+        # The Node/SQLite runtime owns durable account state. In worker mode,
+        # return the freshly registered SSO and mailbox credential to the
+        # loopback caller instead of importing into PostgreSQL here.
+        external_result = str(
+            os.environ.get("GROK2API_REGISTRATION_EXTERNAL_RESULT") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if external_result:
+            receiver = sess.get("_receiver")
+            mailbox = {
+                "id": str(getattr(receiver, "email_id", "") or ""),
+                "address": str(getattr(receiver, "email", "") or email or ""),
+                "access_token": str(getattr(receiver, "token", "") or ""),
+                "provider": str(getattr(receiver, "provider", "") or "cfmail"),
+            }
+            sess["auth_json"] = {
+                "external_registration": {
+                    "sso": str(sso),
+                    "email": str(email or ""),
+                    "password": str(password or ""),
+                    "mailbox": mailbox,
+                }
+            }
+            update(
+                "completed",
+                f"registration completed; handing SSO to Node [{ADAPTER_BUILD}]",
+                external_result=True,
+            )
+            return
+
         # Required path: SSO/session JWT -> sso_to_auth_json device flow -> auth.json
         update(
             "importing",

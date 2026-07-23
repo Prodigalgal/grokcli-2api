@@ -12,6 +12,7 @@ import { CloudflareRegistrationTaskRunner } from "./registration/cloudflare-regi
 import { CloudflareEmailLoginTaskRunner } from "./registration/cloudflare-email-login-runner.js";
 import { CloudflareTempMailClient } from "./registration/cloudflare-temp-mail.js";
 import { SingBoxRegistrationProxyManager } from "./registration/sing-box-proxy-manager.js";
+import { PythonRegistrationTaskRunner } from "./registration/python-registration-runner.js";
 import { SingleInstanceLock } from "./runtime/single-instance-lock.js";
 import { SqliteStore } from "./storage/sqlite-store.js";
 import { UsageRecorder } from "./usage/recorder.js";
@@ -36,7 +37,19 @@ const registrationProxy = config.registrationProxySubscriptionUrl
   })
   : null;
 const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword && registrationProxy
-  ? new CloudflareRegistrationTaskRunner(browserRunner, new CloudflareTempMailClient({
+  ? config.registrationServiceUrl
+    ? new PythonRegistrationTaskRunner({
+      serviceUrl: config.registrationServiceUrl,
+      token: config.registrationServiceToken,
+      timeoutMs: config.registrationTimeoutMs,
+      cfMailBaseUrl: config.cfMailBaseUrl,
+      cfMailAdminPassword: config.cfMailAdminPassword,
+      cfMailDomain: config.cfMailDomain,
+      proxyProvider: registrationProxy,
+      ssoConverter: ssoReauth,
+      mailboxStore: store,
+    })
+    : new CloudflareRegistrationTaskRunner(browserRunner, new CloudflareTempMailClient({
     baseUrl: config.cfMailBaseUrl,
     adminPassword: config.cfMailAdminPassword,
     domain: config.cfMailDomain,

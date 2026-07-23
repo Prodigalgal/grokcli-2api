@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Main container entrypoint:
 # 1) optionally start in-process Turnstile Solver on 127.0.0.1:5072  (Python captcha)
-# 2) when runtime=go, start Python registration/SSO sidecar on 127.0.0.1:18070
-# 3) start grokcli-2api using the selected main runtime (Go preferred; Python fallback)
+# 2) run either the Go app or the isolated Python registration worker
 set -euo pipefail
 cd /app
 
@@ -25,8 +24,11 @@ case "${runtime}" in
     echo "[entrypoint] set GROK2API_RUNTIME=go (default) and keep registration/captcha sidecars" >&2
     exit 2
     ;;
+  registration-worker)
+    APP_CMD=()
+    ;;
   *)
-    echo "[entrypoint] invalid GROK2API_RUNTIME=${GROK2API_RUNTIME}; expected go" >&2
+    echo "[entrypoint] invalid GROK2API_RUNTIME=${GROK2API_RUNTIME:-}; expected go or registration-worker" >&2
     exit 2
     ;;
 esac
@@ -207,9 +209,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Schema first: sidecars and the Go app both expect applied migrations.
-if ! run_migrations; then
-  exit 1
+# The isolated worker returns credentials to Node and owns no durable state.
+if [[ "${runtime}" != "registration-worker" ]]; then
+  if ! run_migrations; then
+    exit 1
+  fi
 fi
 
 # Force local solver URL to loopback when using inline mode. This only keeps the
@@ -227,8 +231,18 @@ fi
 # The registration sidecar is loopback-only and implements:
 #   /internal/registration/v1/*
 #   /internal/sso/v1/*
-if [[ "${runtime}" == "go" && "${GROK2API_REGISTRATION_SIDECAR:-1}" != "0" ]]; then
+if [[ ( "${runtime}" == "go" || "${runtime}" == "registration-worker" ) && "${GROK2API_REGISTRATION_SIDECAR:-1}" != "0" ]]; then
   start_registration_sidecar
+fi
+
+if [[ "${runtime}" == "registration-worker" ]]; then
+  if [[ -z "${reg_pid}" ]]; then
+    echo "[entrypoint] ERROR: registration worker failed to start" >&2
+    exit 1
+  fi
+  echo "[entrypoint] registration worker ready"
+  wait "${reg_pid}"
+  exit $?
 fi
 
 echo "[entrypoint] starting app (${runtime}): ${APP_CMD[*]}"
