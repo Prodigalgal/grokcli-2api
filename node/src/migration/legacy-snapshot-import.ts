@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
+import { computeSnapshotChecksums } from "./snapshot-checksum.js";
 import { supportedSettings } from "./unsupported-integration-settings.js";
 import type {
   ApiKeySnapshotInput,
@@ -78,19 +78,11 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
     store.replaceSettingsSnapshot(settings, now);
     store.replaceLegacyOperationalHistory(history);
   });
-  const inventory = createHash("sha256");
-  const credentials = createHash("sha256");
-  for (const account of [...accounts].sort((left, right) => left.id.localeCompare(right.id))) {
-    inventory.update(`${account.id}\u0000${account.email ?? ""}\u0000${account.userId ?? ""}\u0000${account.teamId ?? ""}\n`);
-    credentials.update(`${account.id}\u0000${hash(canonicalJson(account.payload))}\n`);
-  }
-  for (const key of [...apiKeys].sort((left, right) => left.id.localeCompare(right.id))) {
-    inventory.update(`key\u0000${key.id}\u0000${key.enabled ? "1" : "0"}\n`);
-    credentials.update(`key\u0000${key.id}\u0000${key.keyHash}\n`);
-  }
-  for (const model of [...models].sort((left, right) => left.id.localeCompare(right.id))) {
-    inventory.update(`model\u0000${model.id}\u0000${model.hidden ? "1" : "0"}\n`);
-  }
+  const checksums = computeSnapshotChecksums({
+    accounts,
+    apiKeys,
+    models: models.map((model) => ({ id: model.id, hidden: model.hidden ?? false })),
+  });
   return {
     source: snapshot.source ?? "legacy-snapshot",
     accounts: accounts.length,
@@ -103,8 +95,7 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
     taskLogs: history.records.filter((record) => record.sourceTable === "task_logs").length,
     auditLogs: history.records.filter((record) => record.sourceTable === "admin_audit_logs").length,
     skippedUnsupportedSettings,
-    inventorySha256: inventory.digest("hex"),
-    credentialsSha256: credentials.digest("hex"),
+    ...checksums,
   };
 }
 
@@ -348,25 +339,4 @@ function epoch(value: unknown): number | null {
     throw new Error("snapshot epoch is outside the supported range");
   }
   return Math.trunc(milliseconds);
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new Error("snapshot contains a non-finite number");
-    }
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
-  }
-  const object = record(value, "snapshot JSON value");
-  return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
-}
-
-function hash(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
 }

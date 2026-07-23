@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { computeSnapshotChecksums } from "./snapshot-checksum.js";
 import { isUnsupportedIntegrationSetting } from "./unsupported-integration-settings.js";
 
 export interface PostgresQueryResult<T> {
@@ -24,6 +24,7 @@ export interface PostgresSnapshotReport {
   readonly auditLogs: number;
   readonly skippedUnsupportedSettings: number;
   readonly inventorySha256: string;
+  readonly credentialsSha256: string;
 }
 
 export interface PostgresSnapshotExport {
@@ -186,13 +187,24 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
       admin_audit_logs: auditLogsResult.rows.map(historyRow),
     },
   };
-  const inventory = createHash("sha256");
-  for (const account of accounts) {
-    inventory.update(`${account.id}\u0000${account.email ?? ""}\u0000${account.user_id ?? ""}\n`);
-  }
-  for (const row of keysResult.rows) {
-    inventory.update(`key\u0000${text(row.id)}\u0000${text(row.key_hash)}\n`);
-  }
+  const checksums = computeSnapshotChecksums({
+    accounts: accounts.map((account) => ({
+      id: text(account.id),
+      email: nullableText(account.email),
+      userId: nullableText(account.user_id),
+      teamId: nullableText(account.team_id),
+      payload: object(account.payload),
+    })),
+    apiKeys: keysResult.rows.map((row) => ({
+      id: text(row.id),
+      enabled: boolean(row.enabled, true),
+      keyHash: text(row.key_hash).toLowerCase(),
+    })),
+    models: modelsResult.rows.map((row) => ({
+      id: text(row.id),
+      hidden: boolean(row.hidden, false),
+    })),
+  });
   return {
     snapshot,
     report: {
@@ -206,7 +218,7 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
       taskLogs: taskLogsResult.rows.length,
       auditLogs: auditLogsResult.rows.length,
       skippedUnsupportedSettings,
-      inventorySha256: inventory.digest("hex"),
+      ...checksums,
     },
   };
 }

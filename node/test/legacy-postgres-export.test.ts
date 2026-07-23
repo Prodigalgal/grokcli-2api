@@ -9,6 +9,8 @@ import {
   type PostgresSnapshotSource,
   writePrivateSnapshot,
 } from "../src/migration/legacy-postgres-export.js";
+import { importLegacySnapshot, type LegacySnapshot } from "../src/migration/legacy-snapshot-import.js";
+import { SqliteStore } from "../src/storage/sqlite-store.js";
 
 class FakePostgresSource implements PostgresSnapshotSource {
   async query<T extends Record<string, unknown>>(sql: string): Promise<{ readonly rows: readonly T[] }> {
@@ -153,12 +155,25 @@ test("PostgreSQL exporter creates an importable, secret-silent snapshot", async 
   assert.equal(exported.report.auditLogs, 1);
   assert.equal(exported.report.skippedUnsupportedSettings, 1);
   assert.match(exported.report.inventorySha256, /^[a-f0-9]{64}$/);
+  assert.match(exported.report.credentialsSha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(snapshot.account_pool[0]?.extra, { source: "legacy" });
   assert.equal(snapshot.api_keys[0]?.key_hash, "0".repeat(64));
   assert.deepEqual(snapshot.settings, { models_meta: { source: "legacy" } });
   assert.equal(snapshot.history.usage_events[0]?.request_id, null);
   assert.equal(snapshot.history.task_logs[0]?.id, "3");
   assert.equal(snapshot.history.admin_audit_logs[0]?.id, "5");
+
+  const directory = mkdtempSync(join(tmpdir(), "grok2api-export-import-checksum-test-"));
+  const store = new SqliteStore(join(directory, "app.sqlite"));
+  try {
+    store.migrate();
+    const imported = importLegacySnapshot(store, exported.snapshot as unknown as LegacySnapshot);
+    assert.equal(imported.inventorySha256, exported.report.inventorySha256);
+    assert.equal(imported.credentialsSha256, exported.report.credentialsSha256);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("private snapshots are atomically written without emitting their content", () => {
