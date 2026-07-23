@@ -132,10 +132,11 @@ credential must use the durable device-login fallback instead.
 ### Node Runtime Configuration
 
 The Node target reads only `GROK2API_XAI_UPSTREAM_BASE_URL` for direct xAI
-completion traffic. It deliberately ignores the old CPA proxy variable. Set
-`GROK2API_CFMAIL_BASE_URL`, `GROK2API_CFMAIL_API_KEY`, and optionally
-`GROK2API_CFMAIL_DOMAIN` for the sole supported registration mailbox provider:
-Cloudflare Temp Mail.
+completion traffic. The production template explicitly uses the first-party
+CLI Responses endpoint `https://cli-chat-proxy.grok.com/v1` and deliberately
+ignores the old CPA proxy variable. Set `GROK2API_CFMAIL_BASE_URL`,
+`GROK2API_CFMAIL_API_KEY`, and optionally `GROK2API_CFMAIL_DOMAIN` for the
+sole supported registration mailbox provider: Cloudflare Temp Mail.
 
 `node/deploy/` contains a single-replica Kubernetes template plus deliberately
 suspended exporter and importer Jobs. The exporter uses a separate
@@ -266,9 +267,9 @@ The public route surface remains stable throughout the migration:
 
 - OpenAI-compatible `/v1/models`, `/v1/chat/completions`, and `/v1/responses`.
 - No Anthropic Messages compatibility route is a migration target.
-- No Sub2API or CPA client/protocol integration is a migration target. A direct
-  xAI upstream endpoint must be explicitly configured before Chat or Responses
-  requests are enabled.
+- No Sub2API or CPA client/protocol integration is a migration target. The
+  direct first-party xAI upstream is explicitly configured before Chat or
+  Responses requests are enabled.
 - Health, readiness, metrics, static admin pages, and every existing
   `/admin/api/*` route.
 - Account import/export, registration, SSO import, device login, maintainer,

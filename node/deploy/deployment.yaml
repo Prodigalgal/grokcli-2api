@@ -78,10 +78,7 @@ spec:
                   name: grok2api-secrets
                   key: GROK2API_CFMAIL_API_KEY
             - name: GROK2API_XAI_UPSTREAM_BASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: grok2api-secrets
-                  key: GROK2API_XAI_UPSTREAM_BASE_URL
+              value: https://cli-chat-proxy.grok.com/v1
           ports:
             - name: http
               containerPort: 3000
