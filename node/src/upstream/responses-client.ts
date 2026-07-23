@@ -130,6 +130,9 @@ export function chatToResponsesPayload(body: Record<string, unknown>, model: str
   if (tools.length > 0) {
     output.tools = tools;
   }
+  if (typeof body.stream_tool_calls === "boolean") {
+    output.stream_tool_calls = body.stream_tool_calls;
+  }
   for (const field of ["temperature", "top_p", "tool_choice", "prompt_cache_key", "user", "max_output_tokens"]) {
     if (body[field] !== undefined && body[field] !== null) {
       output[field] = body[field];

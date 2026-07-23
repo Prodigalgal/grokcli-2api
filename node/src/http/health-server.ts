@@ -48,6 +48,20 @@ function requestBody(request: FastifyRequest): Record<string, unknown> {
   return body as Record<string, unknown>;
 }
 
+function withGrokConversationHint(request: FastifyRequest, body: Record<string, unknown>): Record<string, unknown> {
+  if (typeof body.prompt_cache_key === "string" && body.prompt_cache_key.trim()) {
+    return body;
+  }
+  for (const name of ["x-grok-conv-id", "x-grok-session-id"] as const) {
+    const raw = request.headers[name];
+    const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+    if (value) {
+      return { ...body, prompt_cache_key: value };
+    }
+  }
+  return body;
+}
+
 function beginSse(reply: FastifyReply): void {
   reply.hijack();
   reply.raw.writeHead(200, {
@@ -535,7 +549,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
         return reply.code(503).header("cache-control", "no-store").send({ detail: "chat service unavailable" });
       }
       try {
-        const body = requestBody(request);
+        const body = withGrokConversationHint(request, requestBody(request));
         if (body.stream === true) {
           beginSse(reply);
           try {
@@ -566,7 +580,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
         return reply.code(503).header("cache-control", "no-store").send({ detail: "chat service unavailable" });
       }
       try {
-        const raw = requestBody(request);
+        const raw = withGrokConversationHint(request, requestBody(request));
         const chatBody = responsesToChatBody(raw, defaultModel);
         if (!Array.isArray(chatBody.messages) || chatBody.messages.length === 0) {
           return reply.code(400).header("cache-control", "no-store").send({

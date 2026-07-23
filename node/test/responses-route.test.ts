@@ -29,7 +29,13 @@ async function close(server: Server): Promise<void> {
 }
 
 test("responses route maps input through chat and returns a completed response object", async () => {
-  const upstream = createServer((_request, response) => {
+  const captured: { value: Record<string, unknown> | null } = { value: null };
+  const upstream = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk as Uint8Array));
+    }
+    captured.value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.end([
       'data: {"type":"response.created","response":{"id":"upstream","model":"grok-4.5","created_at":1700000000}}\n\n',
@@ -50,7 +56,7 @@ test("responses route maps input through chat and returns a completed response o
   try {
     const response = await fetch(`http://127.0.0.1:${apiPort}/v1/responses`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-grok-conv-id": "grok-conversation-1" },
       body: JSON.stringify({ input: "hello", instructions: "be concise", previous_response_id: "resp_previous", metadata: { trace_id: "trace-1" } }),
     });
     assert.equal(response.status, 200);
@@ -60,6 +66,7 @@ test("responses route maps input through chat and returns a completed response o
     assert.equal(body.output[0]?.content[0]?.text, "response text");
     assert.equal(body.usage.total_tokens, 7);
     assert.equal(body.previous_response_id, "resp_previous");
+    assert.equal(captured.value?.prompt_cache_key, "grok-conversation-1");
   } finally {
     await api.close();
     await close(upstream);

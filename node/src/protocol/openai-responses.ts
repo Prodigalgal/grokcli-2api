@@ -77,7 +77,7 @@ export function responsesToChatBody(raw: Record<string, unknown>, defaultModel: 
     stream: raw.stream === true,
     messages: messages(raw.input, raw.instructions),
   };
-  for (const field of ["max_output_tokens", "max_tokens", "tools", "tool_choice", "parallel_tool_calls", "temperature", "top_p", "user", "reasoning", "reasoning_effort", "prompt_cache_key"]) {
+  for (const field of ["max_output_tokens", "max_tokens", "tools", "tool_choice", "parallel_tool_calls", "stream_tool_calls", "temperature", "top_p", "user", "reasoning", "reasoning_effort", "prompt_cache_key"]) {
     if (raw[field] !== undefined && raw[field] !== null) {
       body[field === "max_output_tokens" ? "max_tokens" : field] = raw[field];
     }
