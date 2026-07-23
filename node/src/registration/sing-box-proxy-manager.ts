@@ -89,7 +89,10 @@ export class SingBoxRegistrationProxyManager implements RegistrationProxyProvide
     };
     this.releases.set(leaseId, release);
     try {
-      await waitForPort(port, child, this.startupTimeoutMs);
+      await Promise.race([
+        waitForPort(port, child, this.startupTimeoutMs),
+        new Promise<never>((_resolve, reject) => child.once("error", () => reject(new Error("could not start sing-box registration proxy")))),
+      ]);
     } catch (error) {
       await release();
       throw error;
