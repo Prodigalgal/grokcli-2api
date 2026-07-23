@@ -66,6 +66,11 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
       throw new Error(`snapshot pool references unknown account ${pool.accountId}`);
     }
   }
+  const checksums = computeSnapshotChecksums({
+    accounts,
+    apiKeys,
+    models: models.map((model) => ({ id: model.id, hidden: model.hidden ?? false })),
+  });
   store.transaction(() => {
     for (const account of accounts) {
       store.saveAccount(account, now);
@@ -77,11 +82,10 @@ export function importLegacySnapshot(store: SqliteStore, snapshot: LegacySnapsho
     store.replaceModelSnapshot(models, now);
     store.replaceSettingsSnapshot(settings, now);
     store.replaceLegacyOperationalHistory(history);
-  });
-  const checksums = computeSnapshotChecksums({
-    accounts,
-    apiKeys,
-    models: models.map((model) => ({ id: model.id, hidden: model.hidden ?? false })),
+    const storedChecksums = computeSnapshotChecksums(store.migrationVerificationData());
+    if (storedChecksums.inventorySha256 !== checksums.inventorySha256 || storedChecksums.credentialsSha256 !== checksums.credentialsSha256) {
+      throw new Error("SQLite migration checksum mismatch after read-back verification");
+    }
   });
   return {
     source: snapshot.source ?? "legacy-snapshot",

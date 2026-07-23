@@ -1021,6 +1021,42 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     };
   }
 
+  migrationVerificationData(): {
+    readonly accounts: readonly {
+      readonly id: string;
+      readonly email: string | null;
+      readonly userId: string | null;
+      readonly teamId: string | null;
+      readonly payload: Record<string, unknown>;
+    }[];
+    readonly apiKeys: readonly { readonly id: string; readonly enabled: boolean; readonly keyHash: string }[];
+    readonly models: readonly { readonly id: string; readonly hidden: boolean }[];
+  } {
+    const accounts = (this.db.prepare(`
+      SELECT id, email, user_id, team_id, payload_json FROM accounts ORDER BY id
+    `).all() as Array<{ id: string; email: string | null; user_id: string | null; team_id: string | null; payload_json: string }>).map((row) => ({
+      id: row.id,
+      email: row.email,
+      userId: row.user_id,
+      teamId: row.team_id,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+    }));
+    const apiKeys = (this.db.prepare(`
+      SELECT id, enabled, key_hash FROM api_keys ORDER BY id
+    `).all() as Array<{ id: string; enabled: number; key_hash: string }>).map((row) => ({
+      id: row.id,
+      enabled: row.enabled !== 0,
+      keyHash: row.key_hash,
+    }));
+    const models = (this.db.prepare(`
+      SELECT id, hidden FROM models ORDER BY id
+    `).all() as Array<{ id: string; hidden: number }>).map((row) => ({
+      id: row.id,
+      hidden: row.hidden !== 0,
+    }));
+    return { accounts, apiKeys, models };
+  }
+
   recordUsageBatch(events: readonly UsageEventInput[]): number {
     let recorded = 0;
     this.transaction(() => {
