@@ -137,11 +137,14 @@ completion traffic. It deliberately ignores the old CPA proxy variable. Set
 `GROK2API_CFMAIL_DOMAIN` for the sole supported registration mailbox provider:
 Cloudflare Temp Mail.
 
-`node/deploy/` contains a single-replica Kubernetes template and a deliberately
-suspended import Job. The Node PVC is separate from the legacy data PVC so the
-PostgreSQL/Redis volumes remain a rollback artifact until the acceptance window
-has closed. The template accepts no Redis, PostgreSQL, Python-sidecar, CPA,
-Sub2API, or Anthropic runtime configuration.
+`node/deploy/` contains a single-replica Kubernetes template plus deliberately
+suspended exporter and importer Jobs. The exporter uses a separate
+GitHub-Actions-built migration image inside the cluster, so it can resolve the
+private PostgreSQL Service without exposing a database port. The Node PVC is
+separate from the legacy data PVC so the PostgreSQL/Redis volumes remain a
+rollback artifact until the acceptance window has closed. The runtime template
+accepts no Redis, PostgreSQL, Python-sidecar, CPA, Sub2API, or Anthropic
+configuration.
 
 ## State Ownership and Write Policy
 

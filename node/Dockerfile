@@ -8,6 +8,17 @@ RUN npm ci
 COPY node/ ./
 RUN npm run build
 
+FROM node:22-bookworm-slim AS migration
+
+WORKDIR /app
+
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/build ./build
+COPY node/package.json node/package-lock.json ./
+
+ENTRYPOINT ["node"]
+CMD ["build/src/cli/export-legacy-postgres-snapshot.js"]
+
 FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \

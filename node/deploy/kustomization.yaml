@@ -5,8 +5,5 @@ resources:
   - pvc.yaml
   - deployment.yaml
   - service.yaml
+  - export-job.yaml
   - import-job.yaml
-images:
-  - name: ghcr.io/prodigalgal/grokcli-2api
-    newName: ghcr.io/prodigalgal/grokcli-2api
-    newTag: node-edge

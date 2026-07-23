@@ -72,6 +72,14 @@ jobs:
             type=raw,value=node-edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=node-sha-,format=long
             type=ref,event=pr,prefix=node-pr-
+      - id: migration-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=node-migration-edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=node-migration-sha-,format=long
+            type=ref,event=pr,prefix=node-migration-pr-
       - name: Build and optionally push Node migration image
         uses: docker/build-push-action@v6
         with:
@@ -81,5 +89,17 @@ jobs:
           push: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.push_image) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and optionally push PostgreSQL export image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: node/Dockerfile
+          target: migration
+          platforms: linux/amd64,linux/arm64
+          push: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.push_image) }}
+          tags: ${{ steps.migration-meta.outputs.tags }}
+          labels: ${{ steps.migration-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
