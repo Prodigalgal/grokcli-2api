@@ -71,3 +71,19 @@ test("pending tasks can be listed and cancelled without racing an active worker"
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("running registration tasks record logs and can be cancelled by their owner", () => {
+  const { db, repo, dir } = createRepository();
+  try {
+    const task = repo.enqueue("registration", "cancel-running", { browser: {} }, 1_000);
+    repo.claimNext("worker-a", 10_000, 1_001);
+    repo.markRunning(task.id, "worker-a", 1_002);
+    repo.appendEvent(task.id, "worker_running", { message: "registration started" }, 1_003);
+    assert.deepEqual(repo.events(task.id).map((event) => event.type), ["running", "worker_running"]);
+    assert.equal(repo.cancelRunning(task.id, "worker-a", 1_004).status, "cancelled");
+    assert.equal(repo.events(task.id).at(-1)?.type, "cancelled");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

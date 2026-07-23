@@ -9,6 +9,7 @@ import { requireApiKey, type ApiKeyAuthConfig, type ApiKeyStore } from "../auth/
 import type { ChatService } from "../chat/service.js";
 import type { DeviceLoginService } from "../auth/device-login-service.js";
 import type { AutomationTaskRepository, AutomationTask } from "../automation/task-repository.js";
+import type { AutomationTaskWorker } from "../automation/task-worker.js";
 import { openAiModelList, type ModelStore } from "../models/catalog.js";
 import { buildResponseObject, ResponsesLiveEncoder, responsesToChatBody } from "../protocol/openai-responses.js";
 import { UpstreamError } from "../upstream/responses-client.js";
@@ -27,8 +28,15 @@ export interface ApiServerOptions {
   readonly chatService?: ChatService | null;
   readonly deviceLogins?: DeviceLoginService | null;
   readonly automationTasks?: AutomationTaskRepository | null;
+  readonly automationWorker?: Pick<AutomationTaskWorker, "cancel"> | null;
   readonly registrationAvailable?: boolean;
+  readonly registrationDefaults?: {
+    readonly mailBaseUrl: string | null;
+    readonly mailDomain: string | null;
+    readonly proxyConfigured: boolean;
+  };
   readonly adminStore?: SqliteStore | null;
+  readonly adminUsername?: string | null;
   readonly adminPassword?: string | null;
 }
 
@@ -76,16 +84,23 @@ function writeSse(reply: FastifyReply, data: string): void {
   reply.raw.write(data);
 }
 
-function hasAdminAccess(request: FastifyRequest, password: string | null): boolean {
+function sameSecret(candidate: string, expected: string): boolean {
+  const expectedBuffer = Buffer.from(expected);
+  const candidateBuffer = Buffer.from(candidate);
+  return candidateBuffer.length === expectedBuffer.length && timingSafeEqual(candidateBuffer, expectedBuffer);
+}
+
+function hasAdminAccess(request: FastifyRequest, username: string | null, password: string | null): boolean {
   if (!password) {
     return false;
   }
   const raw = request.headers["x-admin-password"];
   const supplied = Array.isArray(raw) ? raw[0] : raw;
   const candidate = typeof supplied === "string" ? supplied : "";
-  const expectedBuffer = Buffer.from(password);
-  const candidateBuffer = Buffer.from(candidate);
-  return candidateBuffer.length === expectedBuffer.length && timingSafeEqual(candidateBuffer, expectedBuffer);
+  const rawUsername = request.headers["x-admin-username"];
+  const suppliedUsername = Array.isArray(rawUsername) ? rawUsername[0] : rawUsername;
+  return sameSecret(candidate, password)
+    && (!username || sameSecret(typeof suppliedUsername === "string" ? suppliedUsername : "", username));
 }
 
 function publicTask(task: AutomationTask): Record<string, unknown> {
@@ -114,8 +129,10 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   const chatService = options.chatService ?? null;
   const deviceLogins = options.deviceLogins ?? null;
   const automationTasks = options.automationTasks ?? null;
+  const automationWorker = options.automationWorker ?? null;
   const registrationAvailable = options.registrationAvailable ?? true;
   const adminStore = options.adminStore ?? null;
+  const adminUsername = options.adminUsername?.trim() || null;
   const adminPassword = options.adminPassword?.trim() || null;
   const app = Fastify({
     bodyLimit: 8 * 1024 * 1024,
@@ -155,7 +172,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       reply.code(503).header("cache-control", "no-store").send({ detail: "admin API is disabled" });
       return false;
     }
-    if (!hasAdminAccess(request, adminPassword)) {
+    if (!hasAdminAccess(request, adminUsername, adminPassword)) {
       reply.code(401).header("cache-control", "no-store").send({ detail: "invalid admin credentials" });
       return false;
     }
@@ -311,7 +328,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       return reply.code(400).header("cache-control", "no-store").send({ detail: "name is required and note is limited to 1000 characters" });
     }
     const issued = issueApiKey();
-    const key = store.createApiKey({ id: issued.id, name, note, prefix: issued.prefix, keyHash: issued.keyHash });
+    const key = store.createApiKey({ id: issued.id, name, note, prefix: issued.prefix, keyHash: issued.keyHash, secret: issued.secret });
     return reply.code(201).header("cache-control", "no-store").send({ ok: true, key, secret: issued.secret });
   });
 
@@ -344,7 +361,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     const id = (request.params as { id?: string }).id?.trim() || "";
     const issued = issueApiKey();
     try {
-      const key = store.rotateApiKey(id, issued.prefix, issued.keyHash);
+      const key = store.rotateApiKey(id, issued.prefix, issued.keyHash, issued.secret);
       return reply.header("cache-control", "no-store").send({ ok: true, key, secret: issued.secret });
     } catch (error) {
       return reply.code(404).header("cache-control", "no-store").send({ detail: messageFor(error) });
@@ -446,7 +463,36 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   };
 
   app.post("/admin/api/automation/browser", async (request, reply) => enqueueBrowserTask(request, reply, "browser_automation"));
-  app.post("/admin/api/accounts/register", async (request, reply) => enqueueBrowserTask(request, reply, "registration"));
+  app.post("/admin/api/accounts/register", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return reply;
+    if (!automationTasks || !registrationAvailable) {
+      return reply.code(503).header("cache-control", "no-store").send({ detail: "registration worker is unavailable" });
+    }
+    const body = requestBody(request);
+    const count = typeof body.count === "number" && Number.isInteger(body.count) ? body.count : 1;
+    if (count < 1 || count > 20) {
+      return reply.code(400).header("cache-control", "no-store").send({ detail: "registration count must be between 1 and 20" });
+    }
+    const text = (value: unknown): string => typeof value === "string" ? value.trim() : "";
+    const registration = {
+      proxySubscriptionUrl: text(body.proxy_subscription_url),
+      mailBaseUrl: text(body.mail_base_url),
+      mailApiKey: text(body.mail_api_key),
+      mailDomain: text(body.mail_domain),
+    };
+    for (const [name, value] of [["proxy subscription", registration.proxySubscriptionUrl], ["mail base URL", registration.mailBaseUrl]] as const) {
+      if (value && !value.startsWith("https://")) {
+        return reply.code(400).header("cache-control", "no-store").send({ detail: `${name} must use https` });
+      }
+    }
+    const baseKey = text(body.idempotency_key) || `registration:${randomUUID()}`;
+    const tasks = Array.from({ length: count }, (_unused, index) => automationTasks.enqueue("registration", `${baseKey}:${index + 1}`, {
+      browser: {},
+      registration,
+      mailbox: registration.mailDomain ? { domain: registration.mailDomain } : {},
+    }));
+    return reply.code(202).header("cache-control", "no-store").send({ ok: true, tasks: tasks.map(publicTask), count: tasks.length });
+  });
   app.post("/admin/api/accounts/:id/email-login", async (request, reply) => {
     const store = requireAdminStore(request, reply);
     if (!store) {
@@ -480,6 +526,12 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     return reply.header("cache-control", "no-store").send({
       ok: registrationAvailable,
       provider: "cloudflare_temp_mail",
+      defaults: {
+        mail_base_url: options.registrationDefaults?.mailBaseUrl ?? null,
+        mail_domain: options.registrationDefaults?.mailDomain ?? null,
+        proxy_configured: options.registrationDefaults?.proxyConfigured ?? false,
+        mail_configured: Boolean(options.registrationDefaults?.mailBaseUrl),
+      },
       ...(registrationAvailable ? {} : { detail: "registration mail or dedicated proxy is not configured" }),
     });
   });
@@ -508,7 +560,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     const id = (request.params as { id?: string }).id?.trim() || "";
     const task = automationTasks.get(id);
     return task
-      ? reply.header("cache-control", "no-store").send({ ok: true, task: publicTask(task) })
+      ? reply.header("cache-control", "no-store").send({ ok: true, task: publicTask(task), events: automationTasks.events(id) })
       : reply.code(404).header("cache-control", "no-store").send({ detail: "automation task was not found" });
   });
   app.post("/admin/api/automation/tasks/:id/cancel", async (request, reply) => {
@@ -522,6 +574,12 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     const task = automationTasks.get(id);
     if (!task) {
       return reply.code(404).header("cache-control", "no-store").send({ detail: "automation task was not found" });
+    }
+    if (task.status === "running") {
+      if (!automationWorker?.cancel(id)) {
+        return reply.code(409).header("cache-control", "no-store").send({ detail: "running task is no longer owned by this worker" });
+      }
+      return reply.code(202).header("cache-control", "no-store").send({ ok: true, stopping: true, task: publicTask(task) });
     }
     if (task.status !== "queued" && task.status !== "waiting_input") {
       return reply.code(409).header("cache-control", "no-store").send({ detail: `automation task cannot be cancelled while ${task.status}` });

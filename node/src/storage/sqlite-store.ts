@@ -70,6 +70,7 @@ export interface ApiKeySummary {
   readonly promptTokensTotal: number;
   readonly completionTokensTotal: number;
   readonly totalTokensTotal: number;
+  readonly secret: string | null;
 }
 
 export interface CloudflareMailboxCredential {
@@ -1221,6 +1222,7 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
   listApiKeySummaries(): ApiKeySummary[] {
     const rows = this.db.prepare(`
       SELECT id, name, prefix, enabled, note, created_at, last_used_at, request_count,
+             secret_value,
              prompt_tokens_total, completion_tokens_total, total_tokens_total
       FROM api_keys ORDER BY created_at DESC, id DESC
     `).all() as unknown as ApiKeySummaryRow[];
@@ -1230,6 +1232,7 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
   getApiKeySummary(id: string): ApiKeySummary | null {
     const row = this.db.prepare(`
       SELECT id, name, prefix, enabled, note, created_at, last_used_at, request_count,
+             secret_value,
              prompt_tokens_total, completion_tokens_total, total_tokens_total
       FROM api_keys WHERE id = ?
     `).get(id) as ApiKeySummaryRow | undefined;
@@ -1241,15 +1244,16 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     readonly name: string;
     readonly prefix: string;
     readonly keyHash: string;
+    readonly secret?: string | null;
     readonly note?: string;
   }, now = Date.now()): ApiKeySummary {
     if (!input.id.trim() || !input.name.trim() || !input.prefix.trim() || !/^[a-f0-9]{64}$/i.test(input.keyHash)) {
       throw new Error("API key id, name, prefix, and SHA-256 hash are required");
     }
     this.db.prepare(`
-      INSERT INTO api_keys(id, name, prefix, key_hash, enabled, note, created_at, request_count, prompt_tokens_total, completion_tokens_total, total_tokens_total)
-      VALUES (?, ?, ?, ?, 1, ?, ?, 0, 0, 0, 0)
-    `).run(input.id, input.name.trim(), input.prefix.trim(), input.keyHash.toLowerCase(), input.note?.trim() ?? "", now);
+      INSERT INTO api_keys(id, name, prefix, key_hash, secret_value, enabled, note, created_at, request_count, prompt_tokens_total, completion_tokens_total, total_tokens_total)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0, 0, 0, 0)
+    `).run(input.id, input.name.trim(), input.prefix.trim(), input.keyHash.toLowerCase(), input.secret?.trim() || null, input.note?.trim() ?? "", now);
     const key = this.getApiKeySummary(input.id);
     if (!key) {
       throw new Error(`API key ${input.id} was not persisted`);
@@ -1271,12 +1275,12 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     return this.getApiKeySummary(id)!;
   }
 
-  rotateApiKey(id: string, prefix: string, keyHash: string): ApiKeySummary {
+  rotateApiKey(id: string, prefix: string, keyHash: string, secret?: string | null): ApiKeySummary {
     if (!prefix.trim() || !/^[a-f0-9]{64}$/i.test(keyHash)) {
       throw new Error("API key prefix and SHA-256 hash are required");
     }
-    const result = this.db.prepare("UPDATE api_keys SET prefix = ?, key_hash = ?, enabled = 1 WHERE id = ?")
-      .run(prefix.trim(), keyHash.toLowerCase(), id);
+    const result = this.db.prepare("UPDATE api_keys SET prefix = ?, key_hash = ?, secret_value = ?, enabled = 1 WHERE id = ?")
+      .run(prefix.trim(), keyHash.toLowerCase(), secret?.trim() || null, id);
     if (result.changes !== 1) {
       throw new Error(`API key ${id} was not found`);
     }
@@ -1436,6 +1440,7 @@ interface ApiKeySummaryRow {
   readonly prompt_tokens_total: number;
   readonly completion_tokens_total: number;
   readonly total_tokens_total: number;
+  readonly secret_value: string | null;
 }
 
 interface UsageTotalsRow {
@@ -1484,6 +1489,7 @@ function apiKeySummary(row: ApiKeySummaryRow): ApiKeySummary {
     promptTokensTotal: row.prompt_tokens_total,
     completionTokensTotal: row.completion_tokens_total,
     totalTokensTotal: row.total_tokens_total,
+    secret: row.secret_value,
   };
 }
 

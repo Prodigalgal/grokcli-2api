@@ -32,6 +32,7 @@ export interface AppConfig {
   readonly registrationTimeoutMs: number;
   readonly defaultModel: string;
   readonly legacyApiKey: string | null;
+  readonly adminUsername: string;
   readonly adminPassword: string | null;
   readonly requireApiKey: "auto" | "on" | "off";
   readonly upstreamBase: string | null;
@@ -131,6 +132,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     registrationTimeoutMs: durationSeconds(env, "GROK2API_REGISTRATION_TIMEOUT", 600, 60, 1_800),
     defaultModel: env.GROK2API_DEFAULT_MODEL?.trim() || "grok-4.5",
     legacyApiKey: env.GROK2API_API_KEY?.trim() || null,
+    adminUsername: env.GROK2API_ADMIN_USERNAME?.trim() || "admin",
     adminPassword: env.GROK2API_ADMIN_PASSWORD?.trim() || null,
     requireApiKey: apiKeyMode(env),
     upstreamBase: env.GROK2API_XAI_UPSTREAM_BASE_URL?.trim().replace(/\/+$/, "") || null,

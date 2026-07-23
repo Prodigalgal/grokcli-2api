@@ -6,6 +6,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; min-width: 320px; background: #101418; }
 button, input, select { font: inherit; }
 button { cursor: pointer; border: 1px solid #466f7b; background: #16363d; color: #e7edf1; min-height: 32px; padding: 5px 11px; border-radius: 4px; }
@@ -40,6 +41,15 @@ label { display: grid; gap: 6px; color: #b8c2c7; }
 .tool-surface { border: 1px solid #354149; background: #161d22; border-radius: 6px; padding: 14px; min-height: 180px; }
 h2 { font-size: 14px; margin: 0 0 12px; }
 pre { margin: 0; color: #c8d3d7; white-space: pre-wrap; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+.summary-list { display: grid; gap: 8px; }
+.summary-list div { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #2c363c; }
+.secret-field { display: flex; align-items: center; gap: 6px; min-width: 260px; }
+.secret-field input { min-width: 0; font-family: ui-monospace, Consolas, monospace; }
+.icon-button { width: 36px; min-width: 36px; padding: 8px; }
+.task-facts { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin-bottom: 16px; }
+.task-facts span { color: #9eafb5; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.form-grid .wide { grid-column: 1 / -1; }
 .toolbar { margin-bottom: 12px; }
 .search { min-width: min(330px, 100%); }
 .table-wrap { overflow-x: auto; border: 1px solid #354149; border-radius: 6px; }
@@ -69,4 +79,6 @@ code { display: block; overflow-wrap: anywhere; padding: 12px; color: #f6d48a; b
   .top-actions { justify-content: flex-end; }
   .metrics, .split-grid { grid-template-columns: 1fr 1fr; }
   .metric { min-height: 80px; }
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid .wide { grid-column: auto; }
 }

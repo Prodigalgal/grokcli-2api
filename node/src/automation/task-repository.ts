@@ -20,6 +20,13 @@ export interface AutomationTask {
   readonly finishedAt: number | null;
 }
 
+export interface AutomationTaskEvent {
+  readonly id: number;
+  readonly type: string;
+  readonly detail: Record<string, unknown>;
+  readonly createdAt: number;
+}
+
 interface TaskRow {
   readonly id: string;
   readonly kind: string;
@@ -138,6 +145,37 @@ export class AutomationTaskRepository {
       VALUES (?, 'cancelled', '{"reason":"operator"}', ?)
     `).run(id, now);
     return this.mustGet(id);
+  }
+
+  cancelRunning(id: string, owner: string, now = Date.now()): AutomationTask {
+    const task = this.get(id);
+    if (!task || task.status !== "running" || task.leaseOwner !== owner) {
+      throw new Error(`task ${id} is not running under ${owner}`);
+    }
+    this.db.prepare(`
+      UPDATE automation_tasks SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+        error = NULL, updated_at = ?, finished_at = ? WHERE id = ? AND status = 'running' AND lease_owner = ?
+    `).run(now, now, id, owner);
+    this.appendEvent(id, "cancelled", { reason: "operator" }, now);
+    return this.mustGet(id);
+  }
+
+  appendEvent(id: string, type: string, detail: Record<string, unknown>, now = Date.now()): void {
+    this.db.prepare(`INSERT INTO automation_task_events(task_id, event_type, detail_json, created_at) VALUES (?, ?, ?, ?)`)
+      .run(id, type.slice(0, 80), JSON.stringify(detail), now);
+  }
+
+  events(id: string, limit = 200): AutomationTaskEvent[] {
+    const rows = this.db.prepare(`
+      SELECT id, event_type, detail_json, created_at FROM automation_task_events
+      WHERE task_id = ? ORDER BY id DESC LIMIT ?
+    `).all(id, Math.max(1, Math.min(limit, 500))) as Array<{ id: number; event_type: string; detail_json: string; created_at: number }>;
+    return rows.reverse().map((row) => ({
+      id: row.id,
+      type: row.event_type,
+      detail: objectJson(row.detail_json) ?? {},
+      createdAt: row.created_at,
+    }));
   }
 
   recoverExpired(now = Date.now()): number {

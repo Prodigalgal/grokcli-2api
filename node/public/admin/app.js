@@ -1,4 +1,4 @@
-const state = { password: sessionStorage.getItem("grok2api-admin-password") || "", tab: "overview", accountPage: 1 };
+const state = { username: sessionStorage.getItem("grok2api-admin-username") || "admin", password: sessionStorage.getItem("grok2api-admin-password") || "", tab: "overview", accountPage: 1 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -10,6 +10,7 @@ function setConnection(text, kind = "") {
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
+  headers.set("x-admin-username", state.username);
   headers.set("x-admin-password", state.password);
   if (options.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...options, headers });
@@ -33,7 +34,9 @@ function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (item) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[item]));
 }
 
-function json(value) { return JSON.stringify(value || {}, null, 2); }
+function summary(value, labels) {
+  return Object.entries(labels).map(([key, label]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value?.[key] ?? 0)}</strong></div>`).join("");
+}
 
 function showTab(tab) {
   state.tab = tab;
@@ -49,8 +52,8 @@ async function loadOverview() {
     ["API Key", data.keys?.enabled || 0], ["模型", data.models_count || 0],
   ];
   $("#overview-grid").innerHTML = metrics.map(([name, value]) => `<div class="metric"><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
-  $("#pool-summary").textContent = json(data.pool);
-  $("#usage-summary").textContent = json(data.usage);
+  $("#pool-summary").innerHTML = summary(data.pool, { total: "总数", live: "可用", disabled: "停用", quotaDisabled: "额度停用", cooldown: "冷却", expired: "过期" });
+  $("#usage-summary").innerHTML = summary(data.usage, { requests: "请求", success: "成功", fail: "失败", totalTokens: "Token" });
   setConnection(data.direct_xai?.configured ? "已连接" : "缺少上游", data.direct_xai?.configured ? "ready" : "error");
 }
 
@@ -79,7 +82,8 @@ async function loadAccounts() {
 
 async function loadKeys() {
   const data = await api("/admin/api/keys");
-  $("#keys-body").innerHTML = data.keys.map((key) => `<tr><td>${escapeHtml(key.name)}</td><td>${escapeHtml(key.prefix)}</td><td>${status(key.enabled ? "active" : "disabled")}</td><td>${key.requestCount}</td><td>${key.totalTokensTotal}</td><td><div class="row-actions"><button type="button" data-key-toggle="${escapeHtml(key.id)}" data-enabled="${key.enabled}">${key.enabled ? "停用" : "启用"}</button><button type="button" data-key-rotate="${escapeHtml(key.id)}">轮换</button></div></td></tr>`).join("") || `<tr><td colspan="6">没有 API Key</td></tr>`;
+  $("#keys-body").innerHTML = data.keys.map((key) => `<tr><td>${escapeHtml(key.name)}</td><td><div class="secret-field"><input type="password" readonly value="${escapeHtml(key.secret || "")}" placeholder="${key.secret ? "" : "旧密钥需轮换"}"><button type="button" class="icon-button" data-key-reveal title="显示或隐藏密钥" aria-label="显示或隐藏密钥">&#128065;</button></div></td><td>${status(key.enabled ? "active" : "disabled")}</td><td>${key.requestCount}</td><td>${key.totalTokensTotal}</td><td><div class="row-actions"><button type="button" data-key-toggle="${escapeHtml(key.id)}" data-enabled="${key.enabled}">${key.enabled ? "停用" : "启用"}</button><button type="button" data-key-rotate="${escapeHtml(key.id)}">轮换</button></div></td></tr>`).join("") || `<tr><td colspan="6">没有 API Key</td></tr>`;
+  $$('[data-key-reveal]').forEach((button) => button.addEventListener("click", () => { const input = button.previousElementSibling; input.type = input.type === "password" ? "text" : "password"; }));
   $$('[data-key-toggle]').forEach((button) => button.addEventListener("click", async () => { await api(`/admin/api/keys/${encodeURIComponent(button.dataset.keyToggle)}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) }); await loadKeys(); }));
   $$('[data-key-rotate]').forEach((button) => button.addEventListener("click", async () => { const data = await api(`/admin/api/keys/${encodeURIComponent(button.dataset.keyRotate)}/regenerate`, { method: "POST" }); showSecret(data.secret); await loadKeys(); }));
 }
@@ -92,8 +96,15 @@ async function loadDevices() {
 
 async function loadTasks() {
   const data = await api("/admin/api/automation/tasks?limit=100");
-  $("#tasks-body").innerHTML = data.tasks.map((task) => `<tr><td>${escapeHtml(task.kind)}</td><td>${status(task.status)}</td><td>${task.attempts}</td><td>${date(task.updatedAt)}</td><td><div class="row-actions">${["queued", "waiting_input"].includes(task.status) ? `<button type="button" data-task-cancel="${escapeHtml(task.id)}">取消</button>` : ""}</div></td></tr>`).join("") || `<tr><td colspan="5">没有自动化任务</td></tr>`;
+  $("#tasks-body").innerHTML = data.tasks.map((task) => `<tr><td>${escapeHtml(task.kind)}</td><td>${status(task.status)}</td><td>${task.attempts}</td><td>${date(task.updatedAt)}</td><td><button type="button" data-task-detail="${escapeHtml(task.id)}">查看详情</button></td><td><div class="row-actions">${["queued", "running", "waiting_input"].includes(task.status) ? `<button type="button" data-task-cancel="${escapeHtml(task.id)}">停止</button>` : ""}</div></td></tr>`).join("") || `<tr><td colspan="6">没有自动化任务</td></tr>`;
   $$('[data-task-cancel]').forEach((button) => button.addEventListener("click", async () => { await api(`/admin/api/automation/tasks/${encodeURIComponent(button.dataset.taskCancel)}/cancel`, { method: "POST" }); await loadTasks(); }));
+  $$('[data-task-detail]').forEach((button) => button.addEventListener("click", () => void showTaskDetail(button.dataset.taskDetail)));
+}
+
+async function showTaskDetail(id) {
+  const data = await api(`/admin/api/automation/tasks/${encodeURIComponent(id)}`);
+  const rows = data.events.map((event) => `<tr><td>${date(event.createdAt)}</td><td>${escapeHtml(event.type)}</td><td>${escapeHtml(event.detail?.message || event.detail?.error || "-")}</td></tr>`).join("") || `<tr><td colspan="3">暂无日志</td></tr>`;
+  dialog("注册日志详情", `<div class="task-facts"><span>任务</span><strong>${escapeHtml(data.task.kind)}</strong><span>状态</span><strong>${escapeHtml(data.task.status)}</strong><span>错误</span><strong>${escapeHtml(data.task.error || "-")}</strong></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead><tbody>${rows}</tbody></table></div>`, async () => {});
 }
 
 async function loadTab() {
@@ -134,37 +145,49 @@ function showSecret(secret) {
 
 $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  state.username = $("#admin-username").value.trim();
   state.password = $("#admin-password").value;
   try {
     await api("/admin/api/status");
+    sessionStorage.setItem("grok2api-admin-username", state.username);
     sessionStorage.setItem("grok2api-admin-password", state.password);
     $("#login-view").hidden = true; $("#app-view").hidden = false; await loadTab();
   } catch (error) { const message = $("#login-error"); message.textContent = error.message || "认证失败"; message.hidden = false; }
 });
-$("#logout-button").addEventListener("click", () => { sessionStorage.removeItem("grok2api-admin-password"); state.password = ""; $("#app-view").hidden = true; $("#login-view").hidden = false; setConnection("未连接"); });
+$("#logout-button").addEventListener("click", () => { sessionStorage.removeItem("grok2api-admin-username"); sessionStorage.removeItem("grok2api-admin-password"); state.password = ""; $("#app-view").hidden = true; $("#login-view").hidden = false; setConnection("未连接"); });
 $("#refresh-button").addEventListener("click", () => void loadTab());
 $$('[data-tab]').forEach((button) => button.addEventListener("click", () => showTab(button.dataset.tab)));
 $("#account-search").addEventListener("click", () => { state.accountPage = 1; void loadAccounts(); });
 $("#device-start").addEventListener("click", () => void startDeviceLogin());
 $("#device-start-secondary").addEventListener("click", () => void startDeviceLogin());
 $("#key-create").addEventListener("click", () => dialog("创建 API Key", `<label>名称<input name="name" required maxlength="120"></label><label>备注<input name="note" maxlength="1000"></label>`, async (form) => { const data = await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ name: form.get("name"), note: form.get("note") }) }); showSecret(data.secret); }));
-$("#registration-start").addEventListener("click", () => browserTaskDialog("注册任务", "/admin/api/accounts/register"));
+$("#registration-start").addEventListener("click", () => void registrationDialog());
 $("#automation-start").addEventListener("click", () => browserTaskDialog("浏览器任务", "/admin/api/automation/browser"));
 $("#copy-secret").addEventListener("click", async () => { await navigator.clipboard.writeText($("#issued-secret").textContent || ""); });
 
 function browserTaskDialog(title, endpoint) {
-  dialog(title, `<label>浏览器工作流 JSON<textarea name="browser" required>{"url":"https://accounts.x.ai/","actions":[]}</textarea></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
-    const body = { browser: JSON.parse(String(form.get("browser") || "{}")), idempotency_key: String(form.get("idempotency_key") || "") || undefined };
+  dialog(title, `<label>目标网址<input name="url" type="url" value="https://accounts.x.ai/" required></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
+    const body = { browser: { url: String(form.get("url")), actions: [] }, idempotency_key: String(form.get("idempotency_key") || "") || undefined };
     await api(endpoint, { method: "POST", body: JSON.stringify(body) });
   });
 }
 
+async function registrationDialog() {
+  const availability = await api("/admin/api/accounts/register/availability");
+  const defaults = availability.defaults || {};
+  dialog("启动注册机", `<div class="form-grid"><label>注册数量<input name="count" type="number" min="1" max="20" value="1" required></label><label>代理订阅<input name="proxy" type="url" placeholder="留空使用服务器代理池"></label><label>Temp Mail 地址<input name="mail_base" type="url" value="${escapeHtml(defaults.mail_base_url || "")}" required></label><label>邮箱域名<input name="mail_domain" value="${escapeHtml(defaults.mail_domain || "")}" required></label><label class="wide">Temp Mail 密钥<input name="mail_key" type="password" placeholder="留空使用服务器配置"></label></div>`, async (form) => {
+    await api("/admin/api/accounts/register", { method: "POST", body: JSON.stringify({ count: Number(form.get("count")), proxy_subscription_url: String(form.get("proxy") || ""), mail_base_url: String(form.get("mail_base") || ""), mail_domain: String(form.get("mail_domain") || ""), mail_api_key: String(form.get("mail_key") || "") }) });
+    showTab("tasks");
+  });
+}
+
 function emailLoginDialog(accountId) {
-  dialog("邮箱验证码重登", `<label>浏览器工作流 JSON<textarea name="browser" required>{"url":"https://accounts.x.ai/","actions":[{"type":"fill","selector":"#email","value":"{{account.email}}"}]}</textarea></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
-    const body = { browser: JSON.parse(String(form.get("browser") || "{}")), idempotency_key: String(form.get("idempotency_key") || "") || undefined };
+  dialog("邮箱验证码重登", `<p>将使用该账号已保存的 Cloudflare Temp Mail 邮箱接收验证码。</p><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
+    const body = { browser: { url: "https://accounts.x.ai/", actions: [{ type: "fill", selector: "#email", value: "{{account.email}}" }] }, idempotency_key: String(form.get("idempotency_key") || "") || undefined };
     await api(`/admin/api/accounts/${encodeURIComponent(accountId)}/email-login`, { method: "POST", body: JSON.stringify(body) });
     showTab("tasks");
   });
 }
 
+$("#admin-username").value = state.username;
 if (state.password) { $("#admin-password").value = state.password; $("#login-form").requestSubmit(); }

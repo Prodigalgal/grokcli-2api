@@ -1,4 +1,5 @@
 import type { BrowserTaskRunner } from "../automation/browser-task-runner.js";
+import type { BrowserTaskRuntime } from "../automation/browser-task-runner.js";
 import type { CloudflareMailboxCredentialStore, SsoRegistrationConverter } from "./cloudflare-registration-runner.js";
 import type { RegistrationProxyProvider } from "./sing-box-proxy-manager.js";
 
@@ -10,6 +11,7 @@ interface PythonRegistrationOptions {
   readonly cfMailAdminPassword: string;
   readonly cfMailDomain: string | null;
   readonly proxyProvider: RegistrationProxyProvider;
+  readonly proxyProviderFactory?: (subscriptionUrl: string) => RegistrationProxyProvider;
   readonly ssoConverter: SsoRegistrationConverter;
   readonly mailboxStore: CloudflareMailboxCredentialStore;
   readonly fetchImpl?: typeof fetch;
@@ -22,21 +24,30 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async run(request: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const proxy = await this.options.proxyProvider.acquire();
+  async run(request: Record<string, unknown>, runtime: BrowserTaskRuntime = {}): Promise<Record<string, unknown>> {
+    const registration = record(request.registration);
+    const subscriptionUrl = string(registration?.proxySubscriptionUrl);
+    const proxyProvider = subscriptionUrl && this.options.proxyProviderFactory
+      ? this.options.proxyProviderFactory(subscriptionUrl)
+      : this.options.proxyProvider;
+    let proxy: Awaited<ReturnType<RegistrationProxyProvider["acquire"]>> | null = null;
     let sessionId = "";
     let completed = false;
+    let lastWorkerEvent = "";
     try {
+      proxy = await proxyProvider.acquire();
       const mailbox = record(request.mailbox);
+      runtime.signal?.throwIfAborted();
+      runtime.onEvent?.({ type: "worker_started", message: "注册工作器已启动，已分配独立代理节点" });
       const started = await this.call("/internal/registration/v1/jobs", {
         captcha_provider: "local",
         local_solver_url: "http://127.0.0.1:5072",
         proxy: proxy.server,
         proxy_strategy: "sticky",
         mail_provider: "cfmail",
-        cfmail_base_url: this.options.cfMailBaseUrl,
-        cfmail_api_key: this.options.cfMailAdminPassword,
-        cfmail_domain: string(mailbox?.domain) || this.options.cfMailDomain || "",
+        cfmail_base_url: string(registration?.mailBaseUrl) || this.options.cfMailBaseUrl,
+        cfmail_api_key: string(registration?.mailApiKey) || this.options.cfMailAdminPassword,
+        cfmail_domain: string(registration?.mailDomain) || string(mailbox?.domain) || this.options.cfMailDomain || "",
         count: 1,
         concurrency: 1,
         probe_delay_sec: 0,
@@ -47,8 +58,15 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
       }
       const deadline = Date.now() + this.options.timeoutMs;
       while (Date.now() < deadline) {
+        runtime.signal?.throwIfAborted();
         const session = await this.call(`/internal/registration/v1/sessions/${encodeURIComponent(sessionId)}?include_auth_json=1`, undefined, "GET");
         const status = string(session.status).toLowerCase();
+        const workerMessage = string(session.message) || `注册状态：${status || "running"}`;
+        const workerEvent = `${status}\n${workerMessage}`;
+        if (workerEvent !== lastWorkerEvent) {
+          runtime.onEvent?.({ type: `worker_${status || "running"}`, message: workerMessage });
+          lastWorkerEvent = workerEvent;
+        }
         if (["completed", "success", "imported"].includes(status)) {
           const external = record(record(session.auth_json)?.external_registration);
           const sso = string(external?.sso);
@@ -79,14 +97,15 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
         if (["error", "failed", "expired", "protocol_error", "protocol_blocked", "cancelled", "stopped"].includes(status)) {
           throw new Error(`registration worker ended with ${status}: ${string(session.error || session.message).slice(0, 300)}`);
         }
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        await abortableDelay(1_000, runtime.signal);
       }
       throw new Error("registration worker timed out");
     } finally {
       if (sessionId && !completed) {
         await this.call(`/internal/registration/v1/sessions/${encodeURIComponent(sessionId)}/stop`, {}, "POST").catch(() => undefined);
       }
-      await proxy.release();
+      await proxy?.release();
+      if (proxyProvider !== this.options.proxyProvider) await proxyProvider.close();
     }
   }
 
@@ -111,6 +130,17 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
     }
     return output;
   }
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("registration cancelled"));
+    }, { once: true });
+  });
 }
 
 function record(value: unknown): Record<string, unknown> | null {

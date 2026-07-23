@@ -76,11 +76,12 @@ test("device login admin routes require the admin password and redact device_cod
       }),
     });
     assert.equal(registration.status, 202);
-    const registrationBody = await registration.json() as { task: { id: string; kind: string } };
-    assert.equal(registrationBody.task.kind, "registration");
+    const registrationBody = await registration.json() as { tasks: Array<{ id: string; kind: string }> };
+    const registrationTask = registrationBody.tasks[0]!;
+    assert.equal(registrationTask.kind, "registration");
     assert.equal(JSON.stringify(registrationBody).includes("private@example.test"), false);
-    assert.deepEqual(store.automationTasks().get(registrationBody.task.id)?.request.mailbox, { domain: "mail.example.test" });
-    const taskStatus = await fetch(`http://127.0.0.1:${port}/admin/api/automation/tasks/${registrationBody.task.id}`, {
+    assert.deepEqual(store.automationTasks().get(registrationTask.id)?.request.mailbox, {});
+    const taskStatus = await fetch(`http://127.0.0.1:${port}/admin/api/automation/tasks/${registrationTask.id}`, {
       headers: { "x-admin-password": "admin-test-password" },
     });
     assert.equal(taskStatus.status, 200);
@@ -91,7 +92,7 @@ test("device login admin routes require the admin password and redact device_cod
     });
     assert.equal(taskList.status, 200);
     assert.equal((await taskList.json() as { count: number }).count, 1);
-    const cancelled = await fetch(`http://127.0.0.1:${port}/admin/api/automation/tasks/${registrationBody.task.id}/cancel`, {
+    const cancelled = await fetch(`http://127.0.0.1:${port}/admin/api/automation/tasks/${registrationTask.id}/cancel`, {
       method: "POST",
       headers: { "x-admin-password": "admin-test-password" },
     });

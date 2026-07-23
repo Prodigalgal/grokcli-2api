@@ -19,6 +19,7 @@ export class AutomationTaskWorker {
   private readonly owner: string;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
+  private readonly active = new Map<string, AbortController>();
 
   constructor(private readonly options: AutomationTaskWorkerOptions) {
     this.owner = options.owner?.trim() || `node-${process.pid}`;
@@ -38,6 +39,14 @@ export class AutomationTaskWorker {
       clearInterval(this.timer);
       this.timer = null;
     }
+    for (const controller of this.active.values()) controller.abort();
+  }
+
+  cancel(taskId: string): boolean {
+    const controller = this.active.get(taskId);
+    if (!controller) return false;
+    controller.abort();
+    return true;
   }
 
   async runOnce(): Promise<void> {
@@ -58,6 +67,8 @@ export class AutomationTaskWorker {
         return;
       }
       if (task.kind === "browser_automation" || task.kind === "registration" || task.kind === "sso_email_reauth") {
+        const controller = new AbortController();
+        this.active.set(task.id, controller);
         try {
           const runner = task.kind === "registration"
             ? this.options.registrationRunner
@@ -69,10 +80,16 @@ export class AutomationTaskWorker {
               ? "Cloudflare Temp Mail email login is not configured"
               : "Cloudflare Temp Mail registration is not configured");
           }
-          const result = await runner.run(task.request);
+          const result = await runner.run(task.request, {
+            signal: controller.signal,
+            onEvent: (event) => tasks.appendEvent(task.id, event.type, { message: event.message }),
+          });
           tasks.succeed(task.id, this.owner, result);
         } catch (error) {
-          tasks.fail(task.id, this.owner, messageFor(error));
+          if (controller.signal.aborted) tasks.cancelRunning(task.id, this.owner);
+          else tasks.fail(task.id, this.owner, messageFor(error));
+        } finally {
+          this.active.delete(task.id);
         }
         return;
       }

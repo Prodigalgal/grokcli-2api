@@ -211,4 +211,7 @@ export const migrations: readonly Migration[] = [
     CREATE INDEX IF NOT EXISTS idx_legacy_history_source_created
       ON legacy_history(source_table, created_at DESC);
   `),
+  migration(7, "revealable_api_keys", `
+    ALTER TABLE api_keys ADD COLUMN secret_value TEXT;
+  `),
 ];

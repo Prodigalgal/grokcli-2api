@@ -1,4 +1,6 @@
 import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 
 import { DeviceLoginService } from "./auth/device-login-service.js";
 import { SsoReauthService } from "./auth/sso-reauth-service.js";
@@ -46,6 +48,13 @@ const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword &&
       cfMailAdminPassword: config.cfMailAdminPassword,
       cfMailDomain: config.cfMailDomain,
       proxyProvider: registrationProxy,
+      proxyProviderFactory: (subscriptionUrl) => new SingBoxRegistrationProxyManager({
+        subscriptionUrl,
+        binaryPath: config.singBoxPath,
+        workDir: join(config.singBoxWorkDir, `custom-${randomUUID()}`),
+        startupTimeoutMs: config.singBoxStartupTimeoutMs,
+        tlsInsecure: config.registrationProxyTlsInsecure,
+      }),
       ssoConverter: ssoReauth,
       mailboxStore: store,
     })
@@ -79,8 +88,15 @@ const server = createApiServer({
   chatService: new ChatService(store, config.upstreamBase, config.defaultModel, config.poolMode, usageRecorder),
   deviceLogins,
   automationTasks: store.automationTasks(),
+  automationWorker: taskWorker,
   registrationAvailable: config.automationWorkerEnabled && registrationRunner !== null,
+  registrationDefaults: {
+    mailBaseUrl: config.cfMailBaseUrl,
+    mailDomain: config.cfMailDomain,
+    proxyConfigured: registrationProxy !== null,
+  },
   adminStore: store,
+  adminUsername: config.adminUsername,
   adminPassword: config.adminPassword,
 });
 

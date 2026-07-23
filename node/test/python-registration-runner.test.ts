@@ -116,3 +116,28 @@ test("Python registration worker stops a failed session before releasing its pro
   assert.equal(stopped, 1);
   assert.equal(released, 1);
 });
+
+test("custom registration proxy providers are closed when lease startup fails", async () => {
+  let closed = 0;
+  const runner = new PythonRegistrationTaskRunner({
+    serviceUrl: "http://127.0.0.1:18070",
+    token: null,
+    timeoutMs: 60_000,
+    cfMailBaseUrl: "https://mail.example.test",
+    cfMailAdminPassword: "mail-admin-password",
+    cfMailDomain: "mail.example.test",
+    proxyProvider: { async acquire() { throw new Error("default proxy should not run"); }, async close() {} },
+    proxyProviderFactory(subscriptionUrl) {
+      assert.equal(subscriptionUrl, "https://proxy.example.test/subscription");
+      return {
+        async acquire() { throw new Error("sing-box startup failed"); },
+        async close() { closed += 1; },
+      };
+    },
+    ssoConverter: { async registerFromSsoCookie() { throw new Error("unexpected SSO conversion"); } },
+    mailboxStore: { saveCloudflareMailboxCredential() {} },
+  });
+
+  await assert.rejects(() => runner.run({ registration: { proxySubscriptionUrl: "https://proxy.example.test/subscription" } }), /sing-box startup failed/);
+  assert.equal(closed, 1);
+});

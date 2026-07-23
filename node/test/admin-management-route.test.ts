@@ -7,7 +7,7 @@ import test from "node:test";
 import { createApiServer } from "../src/http/health-server.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
 
-test("SQLite admin management exposes safe account state and one-time API keys", async () => {
+test("SQLite admin management requires both credentials and exposes revealable API keys", async () => {
   const directory = mkdtempSync(join(tmpdir(), "grok2api-admin-management-test-"));
   const store = new SqliteStore(join(directory, "app.sqlite"));
   store.migrate();
@@ -22,13 +22,16 @@ test("SQLite admin management exposes safe account state and one-time API keys",
     adminStore: store,
     modelStore: store,
     apiKeyStore: store,
+    adminUsername: "admin-test-user",
     adminPassword: "admin-test-password",
   });
   const port = await server.listen("127.0.0.1", 0);
-  const adminHeaders = { "x-admin-password": "admin-test-password" };
+  const adminHeaders = { "x-admin-username": "admin-test-user", "x-admin-password": "admin-test-password" };
   try {
     const denied = await fetch(`http://127.0.0.1:${port}/admin/api/status`);
     assert.equal(denied.status, 401);
+    const wrongUser = await fetch(`http://127.0.0.1:${port}/admin/api/status`, { headers: { "x-admin-username": "wrong", "x-admin-password": "admin-test-password" } });
+    assert.equal(wrongUser.status, 401);
 
     const status = await fetch(`http://127.0.0.1:${port}/admin/api/status`, { headers: adminHeaders });
     assert.equal(status.status, 200);
@@ -63,7 +66,7 @@ test("SQLite admin management exposes safe account state and one-time API keys",
 
     const keyList = await fetch(`http://127.0.0.1:${port}/admin/api/keys`, { headers: adminHeaders });
     assert.equal(keyList.status, 200);
-    assert.equal((await keyList.text()).includes(createdBody.secret), false);
+    assert.equal((await keyList.text()).includes(createdBody.secret), true);
 
     const authorizedModels = await fetch(`http://127.0.0.1:${port}/v1/models`, {
       headers: { authorization: `Bearer ${createdBody.secret}` },
@@ -81,6 +84,8 @@ test("SQLite admin management exposes safe account state and one-time API keys",
     assert.equal(oldKey.status, 401);
     const newKey = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { authorization: `Bearer ${rotatedBody.secret}` } });
     assert.equal(newKey.status, 200);
+    const rotatedList = await fetch(`http://127.0.0.1:${port}/admin/api/keys`, { headers: adminHeaders });
+    assert.equal((await rotatedList.text()).includes(rotatedBody.secret), true);
   } finally {
     await server.close();
     store.close();

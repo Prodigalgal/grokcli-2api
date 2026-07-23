@@ -17,6 +17,8 @@ export interface BrowserTaskRuntime {
   readonly variables?: Readonly<Record<string, string>>;
   readonly waitForMailCode?: () => Promise<string>;
   readonly proxyServer?: string;
+  readonly signal?: AbortSignal;
+  readonly onEvent?: (event: { readonly type: string; readonly message: string }) => void;
 }
 
 type BrowserAction =
@@ -53,10 +55,12 @@ export class PlaywrightBrowserTaskRunner implements BrowserTaskRunner {
       ...(runtime.proxyServer ? { proxy: { server: runtime.proxyServer } } : {}),
     });
     try {
+      runtime.signal?.throwIfAborted();
       const context = await browser.newContext();
       const page = await context.newPage();
       await page.goto(spec.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       for (const action of spec.actions) {
+        runtime.signal?.throwIfAborted();
         if (action.type === "click") {
           await page.locator(action.selector).click({ timeout: 30_000 });
         } else if (action.type === "fill") {
