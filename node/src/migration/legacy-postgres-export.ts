@@ -226,10 +226,10 @@ export async function exportLegacyPostgresSnapshot(source: PostgresSnapshotSourc
 export function writePrivateSnapshot(path: string, snapshot: Record<string, unknown>): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.tmp-${process.pid}`;
-  writeFileSync(temporary, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
-  chmodSync(temporary, 0o600);
+  writeFileSync(temporary, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o640 });
+  chmodSync(temporary, 0o640);
   renameSync(temporary, path);
-  chmodSync(path, 0o600);
+  chmodSync(path, 0o640);
 }
 
 function text(value: unknown): string {

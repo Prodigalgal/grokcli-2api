@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -182,6 +182,9 @@ test("private snapshots are atomically written without emitting their content", 
   try {
     writePrivateSnapshot(output, { schema_version: 1, accounts: [] });
     assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), { schema_version: 1, accounts: [] });
+    if (process.platform !== "win32") {
+      assert.equal(statSync(output).mode & 0o777, 0o640);
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
