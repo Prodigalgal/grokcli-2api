@@ -37,6 +37,7 @@ export interface SingBoxProxyManagerOptions {
   readonly binaryPath: string;
   readonly workDir: string;
   readonly startupTimeoutMs?: number;
+  readonly tlsInsecure?: boolean;
   readonly fetchImpl?: typeof fetch;
 }
 
@@ -66,7 +67,7 @@ export class SingBoxRegistrationProxyManager implements RegistrationProxyProvide
     const configPath = join(leaseDir, "config.json");
     const port = await allocatePort();
     mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
-    writeFileSync(configPath, JSON.stringify(buildSingBoxConfig(node, port)), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(configPath, JSON.stringify(buildSingBoxConfig(node, port, this.options.tlsInsecure ?? false)), { encoding: "utf8", mode: 0o600 });
 
     this.activeNodes.add(node.id);
     const child = spawn(this.options.binaryPath, ["run", "-c", configPath], {
@@ -169,7 +170,7 @@ export function parseVlessNode(uri: string): VlessNode | null {
   }
 }
 
-export function buildSingBoxConfig(node: VlessNode, port: number): Record<string, unknown> {
+export function buildSingBoxConfig(node: VlessNode, port: number, tlsInsecure = false): Record<string, unknown> {
   const outbound: Record<string, unknown> = {
     type: "vless",
     tag: "registration-node",
@@ -185,7 +186,7 @@ export function buildSingBoxConfig(node: VlessNode, port: number): Record<string
     outbound.tls = {
       enabled: true,
       server_name: node.serverName,
-      insecure: false,
+      insecure: tlsInsecure,
       utls: { enabled: true, fingerprint: node.fingerprint },
       ...(node.security === "reality" ? {
         reality: { enabled: true, public_key: node.publicKey, short_id: node.shortId },

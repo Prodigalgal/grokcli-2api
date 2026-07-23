@@ -23,6 +23,9 @@ test("sing-box registration proxy parses VLESS Reality into one isolated outboun
     reality: { enabled: true, public_key: "public-key", short_id: "abcd" },
   });
   assert.equal(config.route.final, "registration-node");
+
+  const insecure = buildSingBoxConfig(node, 17891, true) as { outbounds: Array<{ tls?: { insecure?: boolean } }> };
+  assert.equal(insecure.outbounds[0]?.tls?.insecure, true);
 });
 
 test("sing-box registration proxy rejects unsupported subscription entries", () => {

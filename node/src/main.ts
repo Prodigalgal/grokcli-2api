@@ -32,6 +32,7 @@ const registrationProxy = config.registrationProxySubscriptionUrl
     binaryPath: config.singBoxPath,
     workDir: config.singBoxWorkDir,
     startupTimeoutMs: config.singBoxStartupTimeoutMs,
+    tlsInsecure: config.registrationProxyTlsInsecure,
   })
   : null;
 const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword && registrationProxy

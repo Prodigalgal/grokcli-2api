@@ -81,6 +81,8 @@ spec:
               value: /app/data-node/sing-box
             - name: GROK2API_SINGBOX_STARTUP_TIMEOUT
               value: "15"
+            - name: GROK2API_PROXY_TLS_INSECURE
+              value: "0"
             - name: GROK2API_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
