@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grok2api-node-import
+  labels:
+    app.kubernetes.io/name: grok2api
+    app.kubernetes.io/component: node-migration
+spec:
+  suspend: true
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grok2api
+        app.kubernetes.io/component: node-migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        infra.mnnu/node-class: core-public
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: importer
+          image: ghcr.io/prodigalgal/grokcli-2api:node-edge
+          args:
+            - build/src/cli/import-legacy-snapshot.js
+            - /app/data-node/migration/snapshot.json
+          env:
+            - name: GROK2API_SQLITE_PATH
+              value: /app/data-node/app.sqlite
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: node-data
+              mountPath: /app/data-node
+      volumes:
+        - name: node-data
+          persistentVolumeClaim:
+            claimName: grok2api-node-data

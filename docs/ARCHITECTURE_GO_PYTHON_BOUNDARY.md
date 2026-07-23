@@ -1,5 +1,9 @@
 # Go / Python Boundary
 
+> This document describes the current production implementation. The approved
+> single-node TypeScript/Node.js target and staged replacement plan are in
+> [TS_NODE_SINGLE_NODE_MIGRATION.md](./TS_NODE_SINGLE_NODE_MIGRATION.md).
+
 ## Goal
 
 Production traffic and admin control plane run in **Go**.

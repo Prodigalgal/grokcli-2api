@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>grokcli-2api</title>
+    <link rel="stylesheet" href="/admin/app.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">grokcli-2api <span>NODE</span></div>
+        <div class="top-actions">
+          <span id="connection-state" class="state">未连接</span>
+          <button id="refresh-button" type="button">刷新</button>
+          <button id="logout-button" type="button" class="quiet">退出</button>
+        </div>
+      </header>
+
+      <section id="login-view" class="login-view">
+        <form id="login-form" class="login-form">
+          <label>管理密码<input id="admin-password" type="password" autocomplete="current-password" required></label>
+          <button type="submit">进入管理台</button>
+          <p id="login-error" class="form-error" hidden></p>
+        </form>
+      </section>
+
+      <section id="app-view" hidden>
+        <nav class="tabs" aria-label="管理模块">
+          <button type="button" data-tab="overview" class="active">概览</button>
+          <button type="button" data-tab="accounts">账号</button>
+          <button type="button" data-tab="keys">密钥</button>
+          <button type="button" data-tab="device">设备登录</button>
+          <button type="button" data-tab="tasks">自动化</button>
+        </nav>
+
+        <section id="overview-panel" data-panel="overview" class="panel active">
+          <div id="overview-grid" class="metrics"></div>
+          <div class="split-grid">
+            <section class="tool-surface"><h2>账号池</h2><pre id="pool-summary"></pre></section>
+            <section class="tool-surface"><h2>用量</h2><pre id="usage-summary"></pre></section>
+          </div>
+        </section>
+
+        <section data-panel="accounts" class="panel">
+          <div class="toolbar">
+            <label class="search">筛选账号<input id="account-query" type="search" placeholder="账号 ID、邮箱或用户 ID"></label>
+            <select id="account-status"><option value="">全部状态</option><option value="active">可用</option><option value="disabled">已停用</option><option value="quota_disabled">额度停用</option><option value="cooldown">冷却中</option><option value="expired">已过期</option></select>
+            <button id="account-search" type="button">查询</button>
+            <button id="device-start" type="button">设备登录</button>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>账号</th><th>状态</th><th>权重</th><th>请求</th><th>过期</th><th></th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+          <div id="account-pagination" class="pagination"></div>
+        </section>
+
+        <section data-panel="keys" class="panel">
+          <div class="toolbar"><button id="key-create" type="button">创建密钥</button></div>
+          <div class="table-wrap"><table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>请求</th><th>Token</th><th></th></tr></thead><tbody id="keys-body"></tbody></table></div>
+        </section>
+
+        <section data-panel="device" class="panel">
+          <div class="toolbar"><button id="device-start-secondary" type="button">新建设备登录</button></div>
+          <div class="table-wrap"><table><thead><tr><th>用户代码</th><th>状态</th><th>账号</th><th>到期</th><th></th></tr></thead><tbody id="devices-body"></tbody></table></div>
+        </section>
+
+        <section data-panel="tasks" class="panel">
+          <div class="toolbar">
+            <button id="registration-start" type="button">注册任务</button>
+            <button id="automation-start" type="button">浏览器任务</button>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>类型</th><th>状态</th><th>尝试</th><th>更新时间</th><th></th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="form-dialog">
+      <form id="dialog-form" method="dialog">
+        <header><h2 id="dialog-title"></h2><button type="button" id="dialog-close" class="quiet">关闭</button></header>
+        <div id="dialog-fields" class="dialog-fields"></div>
+        <p id="dialog-error" class="form-error" hidden></p>
+        <footer><button id="dialog-submit" type="submit">确认</button></footer>
+      </form>
+    </dialog>
+    <dialog id="secret-dialog"><form method="dialog"><header><h2>新 API Key</h2><button type="submit" class="quiet">关闭</button></header><code id="issued-secret"></code><footer><button id="copy-secret" type="button">复制</button></footer></form></dialog>
+    <script type="module" src="/admin/app.js"></script>
+  </body>
+</html>
