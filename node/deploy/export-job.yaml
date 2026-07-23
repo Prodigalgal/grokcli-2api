@@ -35,11 +35,11 @@ spec:
                   key: DATABASE_URL
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 25m
+              memory: 64Mi
             limits:
-              cpu: 500m
-              memory: 1Gi
+              cpu: 250m
+              memory: 256Mi
           volumeMounts:
             - name: node-data
               mountPath: /app/data-node
