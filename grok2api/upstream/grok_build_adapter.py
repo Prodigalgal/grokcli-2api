@@ -4397,20 +4397,16 @@ def reauthenticate_account(*, email: str, password: str, proxy: str = "") -> dic
     )
     if not sso:
         raise RuntimeError("CreateSession returned no SSO token")
-    from xconsole_client.xai_oauth import complete_build_oauth
+    from xconsole_client.oauth_protocol import login_with_protocol
 
     # Keep the Cloudflare-facing OAuth exchange in the curl_cffi session that
     # owns the login cookies. Node remains the sole durable account writer.
     with tempfile.TemporaryDirectory(prefix="grok2api-reauth-") as oauth_dir:
-        oauth = complete_build_oauth(
+        oauth = login_with_protocol(
             email,
             password,
-            headless=True,
-            timeout=180.0,
             proxy=str(proxy or ""),
-            interactive_fallback=False,
             yescaptcha_key="local",
-            protocol=True,
             debug=False,
             output_dir=oauth_dir,
             session_cookies={"sso": str(sso), "sso-rw": str(sso)},
