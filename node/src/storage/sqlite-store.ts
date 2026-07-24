@@ -1389,7 +1389,6 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
       FROM accounts a
       INNER JOIN account_pool p ON p.account_id = a.id
       ORDER BY p.weight DESC, p.request_count ASC, a.id ASC
-      LIMIT 32
     `).all() as Array<{
       id: string;
       email: string | null;

@@ -666,6 +666,19 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       return reply.code(statusFor(error)).header("cache-control", "no-store").send({ ok: false, account_id: id, error: messageFor(error) });
     }
   });
+  app.post("/admin/api/accounts/probe", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    if (!chatService) return reply.code(503).send({ detail: "chat service unavailable" });
+    const body = requestBody(request);
+    const id = stringField(body, "id");
+    if (!id || !store.getAccountSummary(id)) return reply.code(404).send({ detail: "account was not found" });
+    const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : defaultModel;
+    try {
+      return reply.header("cache-control", "no-store").send(await chatService.probeAccount(id, model));
+    } catch (error) {
+      return reply.code(statusFor(error)).header("cache-control", "no-store").send({ ok: false, account_id: id, error: messageFor(error) });
+    }
+  });
   app.post("/admin/api/accounts/probe-batch", async (request, reply) => {
     const store = requireAdminStore(request, reply); if (!store) return reply;
     if (!chatService) return reply.code(503).send({ detail: "chat service unavailable" });

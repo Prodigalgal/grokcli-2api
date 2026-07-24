@@ -55,8 +55,15 @@ test("chat completion uses selected SQLite account and bridges responses SSE", a
   const dir = mkdtempSync(join(tmpdir(), "grok2api-chat-test-"));
   const store = new SqliteStore(join(dir, "app.sqlite"));
   store.migrate();
+  for (let index = 0; index < 40; index++) {
+    store.saveAccount({
+      id: `expired-${String(index).padStart(2, "0")}`,
+      payload: { access_token: `expired-token-${index}` },
+      expiresAt: Date.now() - 60_000,
+    });
+  }
   store.saveAccount({
-    id: "account-1",
+    id: "zz-account-1",
     payload: { access_token: "account-token", email: "user@example.test" },
   });
   const api = createApiServer({
@@ -79,7 +86,7 @@ test("chat completion uses selected SQLite account and bridges responses SSE", a
     assert.equal(captured.value?.stream, true);
     assert.equal(captured.value?.prompt_cache_key, "session-1");
     assert.equal(Array.isArray(captured.value?.input), true);
-    assert.equal(store.listPoolCandidates()[0]?.requestCount, 1);
+    assert.equal(store.listPoolCandidates().find((candidate) => candidate.id === "zz-account-1")?.requestCount, 1);
   } finally {
     await api.close();
     await close(upstream);
@@ -117,14 +124,15 @@ test("streaming chat forwards bridged chunks and terminal marker", async () => {
   }
 });
 
-test("admin account probe targets the requested SQLite account", async () => {
+test("admin account probe accepts a real xAI account id containing slashes", async () => {
   let authorization = "";
   const upstream = createServer((request, response) => { authorization = String(request.headers.authorization || ""); writeResponsesStream(response); });
   const upstreamPort = await listen(upstream);
   const dir = mkdtempSync(join(tmpdir(), "grok2api-account-probe-test-"));
   const store = new SqliteStore(join(dir, "app.sqlite"));
   store.migrate();
-  store.saveAccount({ id: "account-probe", payload: { access_token: "probe-token" } });
+  const accountId = "https://auth.x.ai::account-probe";
+  store.saveAccount({ id: accountId, payload: { access_token: "probe-token" } });
   const api = createApiServer({
     adminStore: store,
     adminUsername: "admin",
@@ -133,10 +141,10 @@ test("admin account probe targets the requested SQLite account", async () => {
   });
   const apiPort = await api.listen("127.0.0.1", 0);
   try {
-    const response = await fetch(`http://127.0.0.1:${apiPort}/admin/api/accounts/account-probe/probe`, {
+    const response = await fetch(`http://127.0.0.1:${apiPort}/admin/api/accounts/probe`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-admin-username": "admin", "x-admin-password": "secret" },
-      body: JSON.stringify({ model: "grok-4.5" }),
+      body: JSON.stringify({ id: accountId, model: "grok-4.5" }),
     });
     assert.equal(response.status, 200);
     assert.equal(authorization, "Bearer probe-token");
