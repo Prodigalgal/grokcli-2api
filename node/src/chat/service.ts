@@ -133,6 +133,16 @@ function usageFromFrame(raw: string): Record<string, unknown> | null {
   }
 }
 
+function shouldTryAnotherAccount(error: unknown): boolean {
+  if (!(error instanceof UpstreamError)) {
+    return true;
+  }
+  if (error.status >= 500) {
+    return true;
+  }
+  return [401, 403, 408, 409, 425, 429].includes(error.status);
+}
+
 export class ChatService {
   private readonly upstream: ResponsesClient | null;
 
@@ -200,6 +210,10 @@ export class ChatService {
         return { payload, accountId: candidate.id };
       } catch (error) {
         lastError = error;
+        if (!shouldTryAnotherAccount(error)) {
+          this.recordUsage(context, context.requestId ?? randomUUID(), candidate.id, model, false, {});
+          throw error;
+        }
         this.store.reportPoolFailure(candidate.id, error instanceof Error ? error.message : "upstream failure");
       }
     }
@@ -233,6 +247,10 @@ export class ChatService {
         return;
       } catch (error) {
         lastError = error;
+        if (!shouldTryAnotherAccount(error)) {
+          this.recordUsage(context, context.requestId ?? randomUUID(), candidate.id, model, false, {});
+          throw error;
+        }
         this.store.reportPoolFailure(candidate.id, error instanceof Error ? error.message : "upstream failure");
       }
     }

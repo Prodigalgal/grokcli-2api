@@ -7,7 +7,82 @@ import test from "node:test";
 
 import { ChatService } from "../src/chat/service.js";
 import { createApiServer } from "../src/http/health-server.js";
+import { ResponsesLiveEncoder } from "../src/protocol/openai-responses.js";
 import { SqliteStore } from "../src/storage/sqlite-store.js";
+
+function eventData(frame: string): Record<string, unknown> {
+  const line = frame.split("\n").find((value) => value.startsWith("data: "));
+  assert.ok(line, "SSE frame must contain a data line");
+  return JSON.parse(line.slice(6)) as Record<string, unknown>;
+}
+
+test("response.failed satisfies OpenAI and Grok Build strict response schemas", () => {
+  const encoder = new ResponsesLiveEncoder("resp_test", "grok-4.5", {}, 1_700_000_000);
+  const frames = encoder.fail("upstream failed", "upstream_error");
+  const event = eventData(frames[0]!);
+  const response = event.response as Record<string, unknown>;
+  const error = response.error as Record<string, unknown>;
+
+  assert.equal(event.type, "response.failed");
+  assert.equal(event.sequence_number, 0);
+  assert.equal(response.id, "resp_test");
+  assert.equal(response.object, "response");
+  assert.equal(response.created_at, 1_700_000_000);
+  assert.equal(response.status, "failed");
+  assert.equal(response.model, "grok-4.5");
+  assert.deepEqual(response.output, []);
+  assert.equal(typeof response.usage, "object");
+  assert.deepEqual(error, { code: "upstream_error", message: "upstream failed" });
+  assert.equal(frames[1], "data: [DONE]\n\n");
+});
+
+test("responses streaming preserves an upstream 400 and does not retry it across accounts", async () => {
+  let requests = 0;
+  const upstream = createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      code: "invalid-argument",
+      error: "This model's maximum prompt length is 500000 but the request contains 608570 tokens.",
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const dir = mkdtempSync(join(tmpdir(), "grok2api-responses-failure-test-"));
+  const store = new SqliteStore(join(dir, "app.sqlite"));
+  store.migrate();
+  store.saveAccount({ id: "account-1", payload: { access_token: "account-token-1" } });
+  store.saveAccount({ id: "account-2", payload: { access_token: "account-token-2" } });
+  const api = createApiServer({
+    chatService: new ChatService(store, `http://127.0.0.1:${upstreamPort}/v1`, "grok-4.5", "round_robin"),
+  });
+  const apiPort = await api.listen("127.0.0.1", 0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${apiPort}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "grok-4.5", stream: true, input: "continue" }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    const failedFrame = body.split("\n\n").find((frame) => frame.includes('"type":"response.failed"'));
+    assert.ok(failedFrame);
+    const event = eventData(`${failedFrame}\n\n`);
+    const failedResponse = event.response as Record<string, unknown>;
+    assert.deepEqual(failedResponse.error, {
+      code: "invalid-argument",
+      message: "This model's maximum prompt length is 500000 but the request contains 608570 tokens.",
+    });
+    assert.equal(failedResponse.created_at !== undefined, true);
+    assert.deepEqual(failedResponse.output, []);
+    assert.equal(requests, 1);
+    assert.equal(store.listPoolCandidates().length, 2);
+  } finally {
+    await api.close();
+    await close(upstream);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 async function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {

@@ -40,11 +40,38 @@ export interface ApiServerOptions {
 }
 
 function statusFor(error: unknown): number {
-  return error instanceof UpstreamError ? Math.max(502, error.status) : 502;
+  return error instanceof UpstreamError && error.status >= 400 && error.status <= 599 ? error.status : 502;
 }
 
 function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : "upstream request failed";
+}
+
+function responseFailureFor(error: unknown): { readonly code: string; readonly message: string } {
+  if (!(error instanceof UpstreamError)) {
+    return { code: "server_error", message: messageFor(error) };
+  }
+  let code = error.status >= 500 ? "upstream_error" : "invalid_request_error";
+  let message = messageFor(error);
+  try {
+    const parsed = JSON.parse(error.body) as Record<string, unknown>;
+    if (typeof parsed.code === "string" && parsed.code.trim()) {
+      code = parsed.code.trim();
+    }
+    const nested = parsed.error && !Array.isArray(parsed.error) && typeof parsed.error === "object"
+      ? parsed.error as Record<string, unknown>
+      : null;
+    const detail = typeof parsed.error === "string" ? parsed.error
+      : typeof parsed.message === "string" ? parsed.message
+      : typeof nested?.message === "string" ? nested.message
+      : "";
+    if (detail.trim()) {
+      message = detail.trim();
+    }
+  } catch {
+    // Preserve the upstream status context when its body is not JSON.
+  }
+  return { code, message };
 }
 
 function requestBody(request: FastifyRequest): Record<string, unknown> {
@@ -777,7 +804,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
         const chatBody = responsesToChatBody(raw, defaultModel);
         if (!Array.isArray(chatBody.messages) || chatBody.messages.length === 0) {
           return reply.code(400).header("cache-control", "no-store").send({
-            error: { message: "input must contain at least one message", type: "invalid_request_error" },
+            error: { message: "input must contain at least one message", type: "invalid_request_error", param: "input", code: "invalid_request_error" },
           });
         }
         if (raw.stream !== true) {
@@ -807,7 +834,8 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
               writeSse(reply, frame);
             }
           } catch (error) {
-            for (const frame of encoder.fail(messageFor(error))) {
+            const failure = responseFailureFor(error);
+            for (const frame of encoder.fail(failure.message, failure.code)) {
               writeSse(reply, frame);
             }
           }
@@ -816,7 +844,10 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
         }
         return reply;
       } catch (error) {
-        return reply.code(statusFor(error)).header("cache-control", "no-store").send({ detail: messageFor(error) });
+        const failure = responseFailureFor(error);
+        return reply.code(statusFor(error)).header("cache-control", "no-store").send({
+          error: { ...failure, type: statusFor(error) < 500 ? "invalid_request_error" : "server_error", param: null },
+        });
       }
     });
   }

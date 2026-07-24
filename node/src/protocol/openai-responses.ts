@@ -295,10 +295,19 @@ export class ResponsesLiveEncoder {
     return frames;
   }
 
-  fail(message: string): string[] {
+  fail(message: string, code = "server_error"): string[] {
     return [
       this.event("response.failed", {
-        response: { id: this.responseId, object: "response", status: "failed", model: this.model, error: { type: "server_error", message } },
+        response: {
+          id: this.responseId,
+          object: "response",
+          created_at: this.createdAt,
+          status: "failed",
+          model: this.model,
+          output: [],
+          usage: responseUsage(this.usage),
+          error: { code, message },
+        },
       }),
       "data: [DONE]\n\n",
     ];
