@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from grok2api.upstream.sso_device_flow import exchange_sso_for_token
 
@@ -25,8 +26,10 @@ class _Response:
 
 
 class _Session:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_first_token: bool = False) -> None:
         self.cookies = _Cookies()
+        self.fail_first_token = fail_first_token
+        self.token_calls = 0
 
     def get(self, url: str, **_kwargs) -> _Response:
         if url == "https://accounts.x.ai/":
@@ -46,6 +49,9 @@ class _Session:
         if url.endswith("/device/approve"):
             return _Response("https://auth.x.ai/oauth2/device/done")
         if url.endswith("/oauth2/token"):
+            self.token_calls += 1
+            if self.fail_first_token and self.token_calls == 1:
+                return _Response(url, {"error": "invalid_grant"}, ok=False)
             return _Response(url, {"access_token": "access-secret", "refresh_token": "refresh-secret"})
         raise AssertionError(f"unexpected POST {url}")
 
@@ -57,6 +63,13 @@ class SsoDeviceFlowTests(unittest.TestCase):
         self.assertEqual(token["access_token"], "access-secret")
         self.assertIn(("sso", "sso-secret", ".x.ai"), session.cookies.values)
         self.assertIn(("sso-rw", "sso-secret", "accounts.x.ai"), session.cookies.values)
+
+    @patch("grok2api.upstream.sso_device_flow.time.sleep", return_value=None)
+    def test_restarts_device_flow_after_propagation_invalid_grant(self, _sleep) -> None:
+        session = _Session(fail_first_token=True)
+        token = exchange_sso_for_token("sso-secret", session=session)
+        self.assertEqual(token["access_token"], "access-secret")
+        self.assertEqual(session.token_calls, 2)
 
 
 if __name__ == "__main__":
