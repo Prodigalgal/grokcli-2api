@@ -73,7 +73,7 @@ const emailLoginRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
     baseUrl: config.cfMailBaseUrl,
     adminPassword: config.cfMailAdminPassword,
     domain: config.cfMailDomain,
-  }), store, ssoReauth)
+  }), store, ssoReauth, registrationProxy)
   : null;
 const taskWorker = new AutomationTaskWorker({
   store,

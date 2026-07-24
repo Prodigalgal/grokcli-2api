@@ -4,6 +4,7 @@ import {
 } from "../automation/browser-task-runner.js";
 import type { CloudflareMailboxCredential } from "../storage/sqlite-store.js";
 import { CloudflareTempMailClient } from "./cloudflare-temp-mail.js";
+import type { RegistrationProxyProvider } from "./sing-box-proxy-manager.js";
 
 export interface EmailLoginAccountStore {
   getAccount(id: string): { readonly id: string; readonly email: string | null; readonly payload?: Record<string, unknown> } | null;
@@ -20,6 +21,7 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     private readonly mail: CloudflareTempMailClient,
     private readonly accounts: EmailLoginAccountStore,
     private readonly ssoConverter: SsoEmailLoginConverter,
+    private readonly proxyProvider?: RegistrationProxyProvider | null,
   ) {}
 
   async run(request: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -39,22 +41,28 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     if (!supportsSsoCookieCapture(this.browser)) {
       throw new Error("email login browser runner cannot capture the authenticated SSO cookie");
     }
-    const captured = await this.browser.runWithSsoCookie(request, {
-      variables: {
-        "account.email": account.email ?? mailbox.address,
-        "account.password": accountPassword(account.payload),
-        "mailbox.address": mailbox.address,
-        "mailbox.email": mailbox.address,
-      },
-      waitForMailCode: () => this.mail.waitForCode(mailbox),
-    });
-    const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, captured.ssoCookie);
-    return {
-      ...captured.result,
-      accountId: restored.accountId,
-      email: restored.email ?? account.email ?? mailbox.address,
-      recoveredBy: "email_code",
-    };
+    const proxy = await this.proxyProvider?.acquire();
+    try {
+      const captured = await this.browser.runWithSsoCookie(request, {
+        variables: {
+          "account.email": account.email ?? mailbox.address,
+          "account.password": accountPassword(account.payload),
+          "mailbox.address": mailbox.address,
+          "mailbox.email": mailbox.address,
+        },
+        waitForMailCode: () => this.mail.waitForCode(mailbox),
+        ...(proxy ? { proxyServer: proxy.server } : {}),
+      });
+      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, captured.ssoCookie);
+      return {
+        ...captured.result,
+        accountId: restored.accountId,
+        email: restored.email ?? account.email ?? mailbox.address,
+        recoveredBy: "email_code",
+      };
+    } finally {
+      await proxy?.release();
+    }
   }
 }
 
