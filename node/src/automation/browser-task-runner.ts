@@ -57,7 +57,7 @@ export class PlaywrightBrowserTaskRunner implements BrowserTaskRunner {
     });
     try {
       runtime.signal?.throwIfAborted();
-      const context = await browser.newContext({ ignoreHTTPSErrors: Boolean(runtime.proxyServer) });
+      const context = await browser.newContext();
       const page = await context.newPage();
       await page.goto(spec.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       for (const action of spec.actions) {
