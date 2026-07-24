@@ -6,6 +6,8 @@ interface LockOwner {
   readonly createdAt: number;
 }
 
+const processStartedAt = Date.now() - process.uptime() * 1_000;
+
 function isRunning(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -44,7 +46,8 @@ export class SingleInstanceLock {
     } catch {
       // Corrupt lock files have no trustworthy owner and are replaced below.
     }
-    if (previous && isRunning(previous.pid)) {
+    const belongsToCurrentProcess = previous?.pid === process.pid && previous.createdAt >= processStartedAt;
+    if (previous && (belongsToCurrentProcess || (previous.pid !== process.pid && isRunning(previous.pid)))) {
       throw new Error(`another grok2api Node instance is active (pid ${previous.pid})`);
     }
     rmSync(path, { force: true });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,14 @@ test("single instance lock prevents a second active API owner", () => {
     first.release();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("single instance lock replaces a stale lock from an earlier PID 1 container process", () => {
+  const dir = mkdtempSync(join(tmpdir(), "grok2api-stale-lock-"));
+  writeFileSync(join(dir, "grok2api.lock"), JSON.stringify({ pid: process.pid, createdAt: 1 }));
+  const lock = SingleInstanceLock.acquire(dir);
+  lock.release();
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("readiness rejects a Node runtime without an explicit direct xAI upstream", async () => {
