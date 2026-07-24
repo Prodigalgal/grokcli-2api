@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 
 try:
     from grok2api.upstream import grok_build_adapter as reg
@@ -204,6 +205,33 @@ async def list_mail_domains(request: Request) -> dict[str, Any]:
         "count": len(domains),
         "note": note,
     }
+
+
+@app.post(f"{API_PREFIX}/reauth")
+async def reauthenticate(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    adapter = _adapter()
+    try:
+        body = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be object")
+    email = str(body.get("email") or "").strip()
+    password = str(body.get("password") or "").strip()
+    proxy = str(body.get("proxy") or "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password are required")
+    try:
+        result = await run_in_threadpool(
+            adapter.reauthenticate_account,
+            email=email,
+            password=password,
+            proxy=proxy,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)[:500]) from exc
+    return _jsonable(result)
 
 
 @app.post(f"{API_PREFIX}/jobs")

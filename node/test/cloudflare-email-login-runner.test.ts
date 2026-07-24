@@ -74,3 +74,24 @@ test("Cloudflare email-login runner recovers an inbox at runtime", async () => {
   }, { async restoreFromSsoCookie(accountId) { return { accountId, email: "member@example.test" }; } });
   assert.equal((await runner.run({ accountId: "account-2", browser: { url: "https://accounts.example.test", actions: [] } })).recoveredBy, "email_code");
 });
+
+test("Cloudflare email-login runner prefers the legacy local-solver protocol", async () => {
+  const mail = new CloudflareTempMailClient({ baseUrl: "https://mail.example.test", adminPassword: "secret" });
+  const browser: SsoCookieCaptureRunner = { run: async () => { throw new Error("browser should not run"); }, runWithSsoCookie: async () => { throw new Error("browser should not run"); } };
+  const runner = new CloudflareEmailLoginTaskRunner(browser, mail, {
+    getAccount: () => ({ id: "account-3", email: "member@example.test", payload: { password: "private-password" } }),
+    getCloudflareMailboxCredential: () => ({ id: "mail-3", address: "member@example.test", accessToken: "private-mail-token" }),
+  }, {
+    async restoreFromSsoCookie(accountId, sso) {
+      assert.equal(sso, "worker-sso");
+      return { accountId, email: "member@example.test" };
+    },
+  }, {
+    async reauthenticate(email, password) {
+      assert.equal(email, "member@example.test");
+      assert.equal(password, "private-password");
+      return "worker-sso";
+    },
+  });
+  assert.equal((await runner.run({ accountId: "account-3" })).recoveredBy, "legacy_local_solver_protocol");
+});

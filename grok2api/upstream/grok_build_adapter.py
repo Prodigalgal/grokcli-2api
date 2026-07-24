@@ -4339,6 +4339,66 @@ def stop_all_active_registrations() -> dict[str, Any]:
     }
 
 
+def reauthenticate_account(*, email: str, password: str, proxy: str = "") -> dict[str, Any]:
+    """Recover an existing xAI account via the legacy local-solver protocol path."""
+    email = str(email or "").strip().lower()
+    password = str(password or "").strip()
+    if not email or not password:
+        raise ValueError("email and password are required")
+    ensure_xconsole()
+    from xconsole_client import XConsoleAuthClient, YesCaptchaSolver
+    from xconsole_client import config as C
+
+    signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
+    client = XConsoleAuthClient(debug=False, proxy=str(proxy or ""), signup_url=signin_url)
+    try:
+        client.visit_home()
+    except Exception:
+        pass
+    try:
+        client.load_signup_page()
+    except Exception:
+        pass
+    sitekey = (
+        getattr(client, "turnstile_sitekey", None)
+        or getattr(C, "TURNSTILE_SITEKEY", None)
+        or ""
+    ).strip()
+    if not sitekey:
+        raise RuntimeError("Turnstile sitekey is unavailable")
+    endpoint = _local_solver_base_url(None)
+    ready = wait_for_local_solver(endpoint, timeout_sec=60.0)
+    if not ready.get("ready"):
+        raise RuntimeError(str(ready.get("error") or "local Turnstile solver is unavailable"))
+    solver = YesCaptchaSolver(
+        "local",
+        endpoint=endpoint,
+        timeout=float(os.environ.get("GROK2API_YESCAPTCHA_TIMEOUT", "120") or 120),
+        poll_interval=float(os.environ.get("GROK2API_YESCAPTCHA_POLL", "2") or 2),
+        debug=False,
+        auto_fallback_endpoint=False,
+    )
+    with _local_captcha_lock:
+        turnstile = solver.solve_turnstile(
+            website_url=signin_url,
+            website_key=sitekey,
+            premium=False,
+            fallback_non_premium=True,
+        )
+    if not turnstile:
+        raise RuntimeError("local Turnstile solver returned no token")
+    sso = client.obtain_session_via_password(
+        email=email,
+        password=password,
+        turnstile_token=turnstile,
+        referer=signin_url,
+        retries=4,
+    )
+    if not sso:
+        raise RuntimeError("CreateSession returned no SSO token")
+    return {"ok": True, "sso": str(sso), "executor": "legacy_local_solver_protocol"}
+
+
 def list_registration_sessions() -> dict[str, Any]:
     _clean_old_sessions()
     # Merge Redis-visible sessions/batches so other workers can observe progress.

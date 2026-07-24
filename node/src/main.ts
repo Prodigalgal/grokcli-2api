@@ -15,6 +15,7 @@ import { CloudflareEmailLoginTaskRunner } from "./registration/cloudflare-email-
 import { CloudflareTempMailClient } from "./registration/cloudflare-temp-mail.js";
 import { SingBoxRegistrationProxyManager } from "./registration/sing-box-proxy-manager.js";
 import { PythonRegistrationTaskRunner } from "./registration/python-registration-runner.js";
+import { PythonReauthClient } from "./registration/python-reauth-client.js";
 import { SingleInstanceLock } from "./runtime/single-instance-lock.js";
 import { SqliteStore } from "./storage/sqlite-store.js";
 import { UsageRecorder } from "./usage/recorder.js";
@@ -73,7 +74,11 @@ const emailLoginRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
     baseUrl: config.cfMailBaseUrl,
     adminPassword: config.cfMailAdminPassword,
     domain: config.cfMailDomain,
-  }), store, ssoReauth)
+  }), store, ssoReauth, config.registrationServiceUrl ? new PythonReauthClient({
+    serviceUrl: config.registrationServiceUrl,
+    token: config.registrationServiceToken,
+    timeoutMs: config.registrationTimeoutMs,
+  }) : null)
   : null;
 const taskWorker = new AutomationTaskWorker({
   store,

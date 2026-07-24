@@ -14,12 +14,17 @@ export interface SsoEmailLoginConverter {
   restoreFromSsoCookie(accountId: string, ssoCookie: string): Promise<{ readonly accountId: string; readonly email: string | null }>;
 }
 
+export interface PasswordReauthClient {
+  reauthenticate(email: string, password: string): Promise<string>;
+}
+
 export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
   constructor(
     private readonly browser: BrowserTaskRunner,
     private readonly mail: CloudflareTempMailClient,
     private readonly accounts: EmailLoginAccountStore,
     private readonly ssoConverter: SsoEmailLoginConverter,
+    private readonly passwordReauth?: PasswordReauthClient | null,
   ) {}
 
   async run(request: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -39,10 +44,17 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     if (!supportsSsoCookieCapture(this.browser)) {
       throw new Error("email login browser runner cannot capture the authenticated SSO cookie");
     }
+    const email = account.email ?? mailbox.address;
+    const password = accountPassword(account.payload);
+    if (this.passwordReauth && password) {
+      const sso = await this.passwordReauth.reauthenticate(email, password);
+      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, sso);
+      return { accountId: restored.accountId, email: restored.email ?? email, recoveredBy: "legacy_local_solver_protocol" };
+    }
     const captured = await this.browser.runWithSsoCookie(request, {
       variables: {
-        "account.email": account.email ?? mailbox.address,
-        "account.password": accountPassword(account.payload),
+        "account.email": email,
+        "account.password": password,
         "mailbox.address": mailbox.address,
         "mailbox.email": mailbox.address,
       },
@@ -52,7 +64,7 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     return {
       ...captured.result,
       accountId: restored.accountId,
-      email: restored.email ?? account.email ?? mailbox.address,
+      email: restored.email ?? email,
       recoveredBy: "email_code",
     };
   }
