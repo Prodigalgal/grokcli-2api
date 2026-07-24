@@ -106,7 +106,7 @@ export class CloudflareTempMailClient {
     if (!match) {
       return null;
     }
-    const id = stringValue(match.id) || stringValue(match.address_id);
+    const id = identifierValue(match.id) || identifierValue(match.address_id);
     if (!id) {
       throw new Error("Cloudflare Temp Mail address lookup returned no address id");
     }
@@ -207,6 +207,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function identifierValue(value: unknown): string {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : stringValue(value);
 }
 
 async function objectJson(response: Response, label: string): Promise<Record<string, unknown>> {
