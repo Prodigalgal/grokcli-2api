@@ -42,7 +42,7 @@ test("Cloudflare Temp Mail recovers an existing inbox by address", async () => {
       assert.equal(new Headers(init?.headers).get("x-admin-auth"), "private-admin-password");
       if (url.includes("/admin/address?")) {
         assert.match(url, /query=member%40mail\.example\.test/);
-        return new Response(JSON.stringify({ results: [{ id: "address-7", name: "member", domain: "mail.example.test" }] }), { status: 200 });
+        return new Response(JSON.stringify({ results: [{ id: "address-7", name: "member@mail.example.test" }] }), { status: 200 });
       }
       if (url.endsWith("/admin/show_password/address-7")) {
         return new Response(JSON.stringify({ jwt: "short-lived-inbox-token" }), { status: 200 });

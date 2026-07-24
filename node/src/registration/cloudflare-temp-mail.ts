@@ -240,6 +240,7 @@ function addressFromRow(row: Record<string, unknown>): string {
   const direct = stringValue(row.address) || stringValue(row.email);
   if (direct) return direct;
   const name = stringValue(row.name);
+  if (name.includes("@")) return name;
   const domain = stringValue(row.domain);
   return name && domain ? `${name}@${domain}` : "";
 }
