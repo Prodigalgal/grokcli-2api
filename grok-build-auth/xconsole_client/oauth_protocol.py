@@ -22,6 +22,7 @@ CreateSessionRequest wire layout (reverse-engineered 2026-07):
 """
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import time
@@ -194,7 +195,20 @@ class ProtocolOAuthClient:
         self._yescaptcha_key = (yescaptcha_key or "").strip()
         self.solver: Optional[YesCaptchaSolver] = None
         if self._yescaptcha_key:
-            self.solver = YesCaptchaSolver(self._yescaptcha_key, debug=debug)
+            local_solver = self._yescaptcha_key.lower() == "local"
+            endpoint = None
+            if local_solver:
+                endpoint = (
+                    os.environ.get("GROK2API_LOCAL_SOLVER_URL")
+                    or os.environ.get("LOCAL_SOLVER_URL")
+                    or "http://127.0.0.1:5072"
+                ).strip()
+            self.solver = YesCaptchaSolver(
+                self._yescaptcha_key,
+                endpoint=endpoint,
+                debug=debug,
+                auto_fallback_endpoint=not local_solver,
+            )
         try:
             from curl_cffi import requests as creq
         except ImportError as exc:
