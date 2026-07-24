@@ -180,7 +180,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   });
 
   app.get("/", async (_request, reply) => reply.redirect("/admin"));
-  for (const path of ["/admin", "/admin/", "/admin/accounts", "/admin/keys", "/admin/models", "/admin/usage", "/admin/logs", "/admin/settings"]) {
+  for (const path of ["/admin", "/admin/", "/admin/accounts", "/admin/keys", "/admin/models", "/admin/tasks", "/admin/keepalive", "/admin/usage", "/admin/logs", "/admin/settings"]) {
     app.get(path, async (_request, reply) => reply.type("text/html; charset=utf-8").header("cache-control", "no-store").send(adminAsset("index.html")));
   }
   app.get("/admin/app.css", async (_request, reply) => reply.type("text/css; charset=utf-8").header("cache-control", "public, max-age=300").send(adminAsset("app.css")));
