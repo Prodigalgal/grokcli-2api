@@ -4,7 +4,7 @@ Drives the vendored ``grok-build-auth/xconsole_client`` protocol client to:
 
 1. register an x.ai account with MoeMail + YesCaptcha
 2. extract SSO/session cookies
-3. convert SSO via sso_to_auth_json into a local auth.json entry
+3. return the registration result to the Node runtime for durable storage
 4. import that entry into the multi-account pool
 
 Import of ``xconsole_client`` is deferred so the main API can start even when
@@ -338,7 +338,7 @@ def _resolve_mail_credentials(
 
     Adapter call sites historically pass a single moemail_api_key. When the
     batch was started as YYDS/GPTMail, that field is already the active key
-    (set by Go merge / registration_service). Prefer explicit reg_config slots
+    (set by registration_service). Prefer explicit reg_config slots
     when present so resume stays correct after process restart.
     """
     cfg = reg_config if isinstance(reg_config, dict) else {}
@@ -491,27 +491,8 @@ def _record_register_task(
     finished: bool = True,
     detail: dict[str, Any] | None = None,
 ) -> None:
-    """Best-effort write into admin「任务日志」for protocol registration."""
-    tid = str(task_id or "").strip()
-    if not tid:
-        return
-    try:
-        import grok2api.admin.task_log as task_log
-
-        task_log.record(
-            "register",
-            task_id=tid,
-            summary=str(summary or f"协议注册 {tid}")[:500],
-            status=str(status or "done"),
-            ok=ok,
-            progress_done=int(progress_done or 0),
-            progress_total=int(progress_total or 0),
-            finished=bool(finished),
-            detail=detail if isinstance(detail, dict) else {},
-        )
-    except Exception:
-        # Never break registration workers because of logging.
-        pass
+    """Node persists task events; the worker only returns session progress."""
+    return
 
 
 
@@ -585,7 +566,7 @@ def _throttle_task_log(
     min_interval_sec: float = 1.5,
     force: bool = False,
 ) -> None:
-    """Throttle PG task_logs writes so progress is near-real-time without thrashing DB."""
+    """Throttle worker progress callbacks without writing durable state."""
     tid = str(task_id or "").strip()
     if not tid:
         return
@@ -662,7 +643,6 @@ def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
             "status": st,
             "error": s.get("error"),
             "imported_account_ids": list(s.get("imported_account_ids") or [])[:20],
-            "sub2api_push": s.get("sub2api_push"),
             "adapter_build": s.get("adapter_build") or ADAPTER_BUILD,
             "log_tail": list(s.get("log_lines") or [])[-30:],
         },
@@ -942,10 +922,6 @@ def ensure_xconsole() -> None:
         )
         from xconsole_client.oauth_protocol import (  # noqa: F401
             extract_cookies_from_auth_client,
-        )
-        from xconsole_client.xai_oauth import (  # noqa: F401
-            CLIPROXYAPI_GROK_HEADERS,
-            build_cliproxyapi_auth_record,
         )
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", None) or str(e)
@@ -2787,13 +2763,6 @@ def _run_registration(
         )
         from xconsole_client import config as C
         from xconsole_client.oauth_protocol import extract_cookies_from_auth_client
-        from xconsole_client.xai_oauth import (
-            CLIPROXYAPI_GROK_HEADERS,
-            build_cliproxyapi_auth_record,
-        )
-        import grok2api.pool.accounts as accounts
-        from grok2api.config import UPSTREAM_BASE
-
         update("registering", "visiting signup page")
         _check_cancel()
         client = XConsoleAuthClient(
@@ -3364,7 +3333,7 @@ def _run_registration(
 
         # Current xAI create_account often returns only RSC chunks + CF cookies,
         # with no set-cookie JWT chain. Fall back to password CreateSession and
-        # treat the returned session JWT as the sso cookie for sso_to_auth_json.
+        # Treat the returned session JWT as the SSO cookie returned to Node.
         #
         # Bulk registration hits a race: account is created (HTTP 200) but not
         # yet visible to CreateSession for a few seconds. Multi-round login with
@@ -3509,371 +3478,29 @@ def _run_registration(
 
         # The Node/SQLite runtime owns durable account state. In worker mode,
         # return the freshly registered SSO and mailbox credential to the
-        # loopback caller instead of importing into PostgreSQL here.
-        external_result = str(
-            os.environ.get("GROK2API_REGISTRATION_EXTERNAL_RESULT") or ""
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if external_result:
-            receiver = sess.get("_receiver")
-            mailbox = {
-                "id": str(getattr(receiver, "email_id", "") or ""),
-                "address": str(getattr(receiver, "email", "") or email or ""),
-                "access_token": str(getattr(receiver, "token", "") or ""),
-                "provider": str(getattr(receiver, "provider", "") or "cfmail"),
+        # loopback caller; only Node writes durable account state.
+        receiver = sess.get("_receiver")
+        mailbox = {
+            "id": str(getattr(receiver, "email_id", "") or ""),
+            "address": str(getattr(receiver, "email", "") or email or ""),
+            "access_token": str(getattr(receiver, "token", "") or ""),
+            "provider": str(getattr(receiver, "provider", "") or "cfmail"),
+        }
+        sess["auth_json"] = {
+            "external_registration": {
+                "sso": str(sso),
+                "email": str(email or ""),
+                "password": str(password or ""),
+                "mailbox": mailbox,
             }
-            sess["auth_json"] = {
-                "external_registration": {
-                    "sso": str(sso),
-                    "email": str(email or ""),
-                    "password": str(password or ""),
-                    "mailbox": mailbox,
-                }
-            }
-            update(
-                "completed",
-                f"registration completed; handing SSO to Node [{ADAPTER_BUILD}]",
-                external_result=True,
-            )
-            return
-
-        # Required path: SSO/session JWT -> sso_to_auth_json device flow -> auth.json
+        }
         update(
-            "importing",
-            f"SSO obtained; converting via sso_to_auth_json [{ADAPTER_BUILD}]",
-        )
-        import scripts.sso_to_auth_json as sso_import
-
-        token = sso_import.sso_to_token(sso)
-        if not token or not token.get("access_token"):
-            _note_reg_pressure("device-flow conversion failed", pause_sec=10)
-            raise RuntimeError(
-                "SSO obtained but sso_to_auth_json conversion failed "
-                "(device verify/approve/token poll; often xAI device-flow "
-                "rate_limited/slow_down under concurrent registration). "
-                f"adapter_build={ADAPTER_BUILD}; sso_prefix={sso[:24]!r}"
-            )
-        _key, entry = sso_import.token_to_auth_entry(token, email=email)
-        # Keep the raw SSO cookie with the account so export/re-import works
-        # after process restart (registration sessions are ephemeral).
-        sso_cookie = str(sso or sess.get("sso") or "").strip()
-        reg_password = str(password or sess.get("password") or "").strip()
-        sso_backup_path = ""
-        if sso_cookie:
-            try:
-                sso_backup_path = _persist_registration_sso(
-                    sid=sid,
-                    email=str(entry.get("email") or email or ""),
-                    password=reg_password,
-                    sso=sso_cookie,
-                    batch_id=str(sess.get("batch_id") or "") or None,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"[grok-build-auth] WARN: persist SSO backup failed: {e}")
-        import_payload: dict[str, Any] = {
-            "key": entry["key"],
-            "auth_mode": entry.get("auth_mode", "oidc"),
-            "email": entry.get("email") or email,
-            "refresh_token": entry.get("refresh_token", ""),
-            "expires_at": entry.get("expires_at"),
-            "oidc_issuer": entry.get("oidc_issuer", "https://auth.x.ai"),
-            "oidc_client_id": entry.get("oidc_client_id", ""),
-            "source": "register-email",
-            "registration_session_id": sid,
-        }
-        if sess.get("batch_id"):
-            import_payload["registration_batch_id"] = sess.get("batch_id")
-        if sso_cookie:
-            import_payload["sso"] = sso_cookie
-            import_payload["sso_cookie"] = sso_cookie
-        if reg_password:
-            import_payload["password"] = reg_password
-            import_payload["register_password"] = reg_password
-        if sso_backup_path:
-            import_payload["sso_backup_path"] = sso_backup_path
-        import_result = accounts.import_auth_payload(import_payload, merge=True)
-        if not import_result.get("ok"):
-            raise RuntimeError(
-                f"SSO account import failed: {import_result.get('error')}; "
-                f"adapter_build={ADAPTER_BUILD}"
-            )
-        # Registration import is durable PostgreSQL (accounts + account_pool).
-        # auth.json is not written at runtime in hybrid mode (export-only).
-        storage = import_result.get("storage")
-        if not storage:
-            try:
-                storage = accounts._accounts_store_source()
-            except Exception:
-                storage = "unknown"
-        import_result["storage"] = storage
-        if storage != "postgres":
-            print(
-                f"[grok-build-auth] WARN: import storage={storage} "
-                f"(expected postgres). Check DATABASE_URL / STORE_BACKEND."
-            )
-        # Verify SSO cookie actually landed in durable store (re-read by id).
-        try:
-            imported_probe_ids = [
-                str(x.get("id"))
-                for x in (import_result.get("imported") or [])
-                if isinstance(x, dict) and x.get("id")
-            ]
-            if sso_cookie and imported_probe_ids:
-                from grok2api.pool.accounts import get_sso_value as _gsv
-                try:
-                    from grok2api.pool.auth_store import read_auth_entry as _rae
-                except Exception:
-                    _rae = None  # type: ignore[assignment]
-                for aid in imported_probe_ids[:5]:
-                    hit = _rae(aid) if _rae is not None else None
-                    payload = hit[1] if isinstance(hit, tuple) and len(hit) == 2 else None
-                    if not isinstance(payload, dict):
-                        continue
-                    if _gsv(payload):
-                        continue
-                    print(
-                        f"[grok-build-auth] WARN: account {aid} imported without SSO "
-                        f"in payload; rewriting sso field [{ADAPTER_BUILD}]"
-                    )
-                    fix = dict(payload)
-                    fix["sso"] = sso_cookie
-                    fix["sso_cookie"] = sso_cookie
-                    if reg_password:
-                        fix.setdefault("password", reg_password)
-                        fix.setdefault("register_password", reg_password)
-                    accounts.import_auth_payload(fix, merge=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[grok-build-auth] WARN: post-import SSO verify failed: {e}")
-        imported_rows = [
-            x for x in (import_result.get("imported") or []) if isinstance(x, dict)
-        ]
-        imported_ids = [str(x.get("id")) for x in imported_rows if x.get("id")]
-        imported_accounts = [
-            {"id": x.get("id"), "email": x.get("email") or email}
-            for x in imported_rows
-            if x.get("id") or x.get("email")
-        ]
-        sess["auth_json"] = import_result
-        sess["imported_account_ids"] = imported_ids
-        sess["imported_accounts"] = imported_accounts
-        sess["oauth"] = {
-            "path": "sso_to_auth_json",
-            "access_token": (token.get("access_token") or "")[:20] + "...",
-            "refresh_token": bool(token.get("refresh_token")),
-            "email": email,
-        }
-        # Optional: auto-push newly registered accounts into sub2api.
-        # Controlled by settings → sub2api → auto_push_on_register.
-        # Failures are recorded on the session but never fail registration.
-        sub2api_push: dict[str, Any] | None = None
-        if imported_ids:
-            try:
-                update(
-                    "pushing_sub2api",
-                    f"imported {len(imported_ids)} account(s); "
-                    f"checking auto-push to sub2api [{ADAPTER_BUILD}]",
-                    imported_account_ids=imported_ids,
-                    imported_accounts=imported_accounts,
-                )
-                from grok2api.upstream.sub2api_client import maybe_auto_push_registered_accounts
-
-                sub2api_push = maybe_auto_push_registered_accounts(
-                    imported_ids,
-                    source="register-email",
-                )
-                sess["sub2api_push"] = sub2api_push
-                if sub2api_push and not sub2api_push.get("skipped"):
-                    ok_n = int(sub2api_push.get("success") or 0)
-                    fail_n = int(sub2api_push.get("failed") or 0)
-                    update(
-                        "pushing_sub2api",
-                        f"sub2api auto-push done: ok={ok_n} fail={fail_n} "
-                        f"[{ADAPTER_BUILD}]",
-                        imported_account_ids=imported_ids,
-                        imported_accounts=imported_accounts,
-                        sub2api_push=sub2api_push,
-                    )
-            except Exception as e:  # noqa: BLE001
-                sub2api_push = {
-                    "ok": False,
-                    "skipped": False,
-                    "error": str(e),
-                    "total": len(imported_ids),
-                }
-                sess["sub2api_push"] = sub2api_push
-                print(f"[grok-build-auth] WARN: sub2api auto-push failed: {e}")
-            # Optional: auto-push newly registered accounts into CLIProxyAPI.
-            try:
-                from grok2api.upstream.cliproxyapi_client import (
-                    maybe_auto_push_registered_accounts as maybe_auto_push_cpa,
-                )
-
-                cpa_push = maybe_auto_push_cpa(
-                    imported_ids,
-                    source="register-email",
-                )
-                sess["cliproxyapi_push"] = cpa_push
-                if cpa_push and not cpa_push.get("skipped"):
-                    ok_n = int(cpa_push.get("success") or 0)
-                    fail_n = int(cpa_push.get("failed") or 0)
-                    update(
-                        "pushing_cliproxyapi",
-                        f"CLIProxyAPI auto-push done: ok={ok_n} fail={fail_n} "
-                        f"[{ADAPTER_BUILD}]",
-                        imported_account_ids=imported_ids,
-                        imported_accounts=imported_accounts,
-                        cliproxyapi_push=cpa_push,
-                    )
-            except Exception as e:  # noqa: BLE001
-                sess["cliproxyapi_push"] = {
-                    "ok": False,
-                    "skipped": False,
-                    "error": str(e),
-                    "total": len(imported_ids),
-                }
-                print(f"[grok-build-auth] WARN: CLIProxyAPI auto-push failed: {e}")
-        # Auto probe newly imported accounts so they are validated in the pool.
-        # Release global admission BEFORE the settle sleep so bulk jobs don't
-        # hold scarce inflight slots for REGISTER_PROBE_DELAY_SEC after success.
-        if admission_flag is not None:
-            _release_reg_admission_once(admission_flag)
-        probe_summaries: list[dict[str, Any]] = []
-        if imported_ids:
-            delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
-            if delay > 0:
-                update(
-                    "probing",
-                    f"imported {len(imported_ids)} account(s); wait {int(delay)}s "
-                    f"before probe [{ADAPTER_BUILD}]",
-                    imported_account_ids=imported_ids,
-                    imported_accounts=imported_accounts,
-                    probe_delay_sec=delay,
-                )
-                # Heartbeat during settle wait so multi-worker reclaim does not
-                # treat a healthy post-import session as an orphan.
-                deadline = time.time() + delay
-                while True:
-                    remaining_wait = deadline - time.time()
-                    if remaining_wait <= 0:
-                        break
-                    time.sleep(min(10.0, remaining_wait))
-                    left = max(0.0, deadline - time.time())
-                    if left <= 0:
-                        break
-                    update(
-                        "probing",
-                        f"imported {len(imported_ids)} account(s); wait "
-                        f"{int(left)}s before probe [{ADAPTER_BUILD}]",
-                        imported_account_ids=imported_ids,
-                        imported_accounts=imported_accounts,
-                        probe_delay_sec=delay,
-                    )
-            update(
-                "probing",
-                f"imported {len(imported_ids)} account(s); probing pool health "
-                f"(delay={int(delay)}s) [{ADAPTER_BUILD}]",
-                imported_account_ids=imported_ids,
-                imported_accounts=imported_accounts,
-                probe_delay_sec=delay,
-            )
-            try:
-                import grok2api.pool.model_health as model_health
-
-                for aid in imported_ids:
-                    try:
-                        # New registrations must enter the live rotation pool.
-                        # Never auto-disable / free-usage-cool on the post-import
-                        # probe — free accounts often report free-usage-exhausted
-                        # on the first ping and were wrongly kicked out of 轮询.
-                        pr = model_health.probe_single_account(
-                            aid, None, auto_disable=False, source="register"
-                        )
-                        detail = pr.get("result") if isinstance(pr, dict) else None
-                        if not isinstance(detail, dict):
-                            detail = pr if isinstance(pr, dict) else {}
-                        err_text = (
-                            detail.get("error")
-                            or detail.get("message")
-                            or (pr.get("error") if isinstance(pr, dict) else None)
-                            or ""
-                        )
-                        latency = (
-                            detail.get("latency_ms")
-                            or detail.get("elapsed_ms")
-                            or detail.get("duration_ms")
-                        )
-                        probe_summaries.append(
-                            {
-                                "account_id": aid,
-                                "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
-                                "model": detail.get("model")
-                                or (pr.get("model") if isinstance(pr, dict) else None),
-                                "error": (str(err_text)[:180] if err_text else None),
-                                "latency_ms": latency,
-                            }
-                        )
-                    except Exception as pe:  # noqa: BLE001
-                        probe_summaries.append(
-                            {
-                                "account_id": aid,
-                                "ok": False,
-                                "error": str(pe)[:180],
-                            }
-                        )
-            except Exception as pe:  # noqa: BLE001
-                probe_summaries.append(
-                    {
-                        "account_id": None,
-                        "ok": False,
-                        "error": f"probe module error: {pe}"[:180],
-                    }
-                )
-        # Ensure newly registered accounts stay enabled + not cooling even if a
-        # concurrent background health wave cooled them during import.
-        try:
-            import grok2api.pool.account_pool as account_pool
-            from grok2api.admin.settings_store import get_account_pool_meta, patch_account_pool_meta
-            for aid in imported_ids:
-                try:
-                    account_pool.clear_account_cooldown(aid)
-                except Exception:
-                    pass
-                try:
-                    meta = get_account_pool_meta(aid) or {}
-                    if isinstance(meta, dict) and meta.get("enabled") is False and not meta.get("disabled_for_quota"):
-                        patch_account_pool_meta(
-                            aid,
-                            {
-                                "enabled": True,
-                                "pool_status": "normal",
-                                "disabled_reason": None,
-                                "disabled_source": None,
-                                "cooldown_until": None,
-                                "cooldown_count": 0,
-                            },
-                        )
-                except Exception:
-                    pass
-        except Exception as rexc:
-            print(f"[grok-build-auth] WARN: post-register re-enable failed: {rexc}")
-        sess["probe"] = {
-            "count": len(probe_summaries),
-            "ok": sum(1 for p in probe_summaries if p.get("ok")),
-            "fail": sum(1 for p in probe_summaries if not p.get("ok")),
-            "results": probe_summaries,
-        }
-        ok_n = int(sess["probe"]["ok"])
-        fail_n = int(sess["probe"]["fail"])
-        update(
-            "imported",
-            f"imported via sso_to_auth_json "
-            f"({len(imported_ids) or len(imported_rows)} account(s)); "
-            f"probe ok={ok_n} fail={fail_n} "
-            f"[{ADAPTER_BUILD}]",
-            imported_account_ids=imported_ids,
-            imported_accounts=imported_accounts,
-            probe=sess.get("probe"),
+            "completed",
+            f"registration completed; handing SSO to Node [{ADAPTER_BUILD}]",
+            external_result=True,
         )
         return
+
     except _RegCancelled as exc:
         with _lock:
             cur = _sessions.get(sid) or sess

@@ -486,10 +486,8 @@ def first_working_proxy(candidates: list[str] | None = None, *, timeout: float =
 def get_outbound_proxy_source() -> dict[str, Any]:
     """Load effective outbound proxy pool text/auth/strategy.
 
-    Preference order:
-      1) settings_store.outbound_proxy_config (admin UI)
-      2) env GROK2API_XAI_PROXY_POOL / GROK2API_XAI_PROXY
-      3) registration_config.proxy (shared pool fallback)
+    Node passes a per-registration proxy explicitly. Environment variables are
+    retained as the worker's standalone fallback.
     """
     global _outbound_proxy_cache_key, _outbound_proxy_cache_value
     text = ""
@@ -499,51 +497,17 @@ def get_outbound_proxy_source() -> dict[str, Any]:
     enabled = True
     source = "none"
 
-    try:
-        from grok2api.admin.settings_store import get_outbound_proxy_config
-
-        cfg = get_outbound_proxy_config(include_secrets=True) or {}
-        if isinstance(cfg, dict):
-            enabled = bool(cfg.get("enabled", True))
-            text = str(cfg.get("proxy") or "").strip()
-            user = str(cfg.get("proxy_username") or "").strip()
-            password = str(cfg.get("proxy_password") or "").strip()
-            strategy = normalize_proxy_strategy(
-                str(cfg.get("proxy_strategy") or "round_robin")
-            )
-            if text:
-                source = "settings"
-    except Exception:
-        pass
-
-    if not text:
-        env_text = _env_proxy_text()
-        if env_text:
-            text = env_text
-            user = user or _env_proxy_user()
-            password = password or _env_proxy_pass()
-            strategy = normalize_proxy_strategy(
-                os.getenv("GROK2API_XAI_PROXY_STRATEGY")
-                or os.getenv("GROK2API_PROXY_STRATEGY")
-                or strategy
-            )
-            source = "env"
-
-    if not text:
-        try:
-            from grok2api.admin.settings_store import get_registration_config
-
-            reg = get_registration_config(include_secrets=True) or {}
-            if isinstance(reg, dict) and str(reg.get("proxy") or "").strip():
-                text = str(reg.get("proxy") or "").strip()
-                user = user or str(reg.get("proxy_username") or "").strip()
-                password = password or str(reg.get("proxy_password") or "").strip()
-                strategy = normalize_proxy_strategy(
-                    str(reg.get("proxy_strategy") or strategy)
-                )
-                source = "registration"
-        except Exception:
-            pass
+    env_text = _env_proxy_text()
+    if env_text:
+        text = env_text
+        user = _env_proxy_user()
+        password = _env_proxy_pass()
+        strategy = normalize_proxy_strategy(
+            os.getenv("GROK2API_XAI_PROXY_STRATEGY")
+            or os.getenv("GROK2API_PROXY_STRATEGY")
+            or strategy
+        )
+        source = "env"
 
     cache_key = (bool(enabled), source, text, user, password, strategy)
     with _lock:

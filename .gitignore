@@ -36,6 +36,7 @@ docker-rebuild.local.sh
 # TypeScript/Node migration runtime
 node/node_modules/
 node/build/
+node/data-node/
 
 # Built Go binaries (source lives under cmd/; do not ignore grok2api/ package dir)
 /grok2api-migrate

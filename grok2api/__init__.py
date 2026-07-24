@@ -1,1 +1,1 @@
-"""grok2api package (Python sidecars: registration / SSO / captcha helpers)."""
+"""Optional Python registration and captcha worker helpers."""

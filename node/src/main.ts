@@ -24,6 +24,10 @@ mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
 const lock = SingleInstanceLock.acquire(config.dataDir);
 const store = new SqliteStore(config.databasePath);
 store.migrate();
+const storedDefaultModel = store.getSetting("default_model");
+const runtimeDefaultModel = typeof storedDefaultModel === "string" && storedDefaultModel.trim() ? storedDefaultModel.trim() : config.defaultModel;
+const storedPoolMode = store.getSetting("account_mode");
+const runtimePoolMode = storedPoolMode === "least_used" || storedPoolMode === "random" || storedPoolMode === "round_robin" ? storedPoolMode : config.poolMode;
 const usageRecorder = new UsageRecorder(store, config.usageFlushIntervalMs, config.usageFlushBatch);
 const maintainer = new TokenMaintainer({ store, config });
 const deviceLogins = new DeviceLoginService({ store, config });
@@ -83,9 +87,9 @@ const taskWorker = new AutomationTaskWorker({
 const server = createApiServer({
   modelStore: store,
   apiKeyStore: store,
-  defaultModel: config.defaultModel,
+  defaultModel: runtimeDefaultModel,
   apiKeyAuth: { legacyApiKey: config.legacyApiKey, requireApiKey: config.requireApiKey },
-  chatService: new ChatService(store, config.upstreamBase, config.defaultModel, config.poolMode, usageRecorder),
+  chatService: new ChatService(store, config.upstreamBase, runtimeDefaultModel, runtimePoolMode, usageRecorder),
   deviceLogins,
   automationTasks: store.automationTasks(),
   automationWorker: taskWorker,
@@ -98,6 +102,7 @@ const server = createApiServer({
   adminStore: store,
   adminUsername: config.adminUsername,
   adminPassword: config.adminPassword,
+  maintainer,
 });
 
 let stopping = false;

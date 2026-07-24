@@ -2,8 +2,8 @@
 
 ## Status
 
-The Node migration foundation is implemented locally: Fastify serves the
-OpenAI Models, Chat Completions, and Responses routes; SQLite owns imported
+The Node migration runtime is implemented locally: Fastify serves OpenAI
+Models, Chat Completions, and Responses routes; SQLite owns imported
 accounts, account-pool state, API-key hashes, device-login sessions, and
 automation tasks. Token refresh, automatic SSO recovery, device-code fallback,
 and a bounded Playwright task runner are active Node modules with regression
@@ -75,8 +75,8 @@ distributed coordination store instead of attempting to scale SQLite.
 ```
 
 The API process starts exactly one durable task worker. A worker crash must
-leave the API healthy and its lease recoverable. The public model surface is
-restricted to OpenAI Models, Chat Completions, and Responses; browser, captcha,
+leave the API healthy and its lease recoverable. The public model surface includes
+OpenAI Models, Chat Completions, and Responses; browser, captcha,
 registration, SSO, and device operations are available only through the
 administrator-protected management surface.
 
@@ -141,7 +141,7 @@ credential must use the durable device-login fallback instead.
 The Node target reads only `GROK2API_XAI_UPSTREAM_BASE_URL` for direct xAI
 completion traffic. The production template explicitly uses the first-party
 CLI Responses endpoint `https://cli-chat-proxy.grok.com/v1` and deliberately
-ignores the old CPA proxy variable. Set `GROK2API_CFMAIL_BASE_URL`,
+ignores removed third-party integration proxy variables. Set `GROK2API_CFMAIL_BASE_URL`,
 `GROK2API_CFMAIL_API_KEY`, and optionally `GROK2API_CFMAIL_DOMAIN` for the
 sole supported registration mailbox provider: Cloudflare Temp Mail.
 
@@ -151,8 +151,7 @@ GitHub-Actions-built migration image inside the cluster, so it can resolve the
 private PostgreSQL Service without exposing a database port. The Node PVC is
 separate from the legacy data PVC so the PostgreSQL/Redis volumes remain a
 rollback artifact until the acceptance window has closed. The runtime template
-accepts no Redis, PostgreSQL, Python-sidecar, CPA, Sub2API, or Anthropic
-configuration.
+accepts no Redis, PostgreSQL, or third-party account-push integration configuration.
 
 ## State Ownership and Write Policy
 
@@ -222,8 +221,8 @@ snapshot with `npm run export:legacy-snapshot -- <snapshot.json>`. It writes
 the file atomically with owner-only permissions and prints only output path,
 record counts, and an inventory checksum. It contains account payloads and
 therefore must remain on the protected migration host and data volume.
-Legacy `sub2api`, `cliproxyapi`, and CPA integration settings are deliberately
-excluded by both tools and reported only as a skipped-setting count.
+Removed third-party integration settings are deliberately excluded by both tools
+and reported only as a skipped-setting count.
 
 The Node importer accepts that `schema_version: 1` JSON snapshot through
 `npm run import:legacy-snapshot -- <snapshot.json>`. A full snapshot contains
@@ -277,10 +276,9 @@ of repeated automated login attempts.
 The public route surface remains stable throughout the migration:
 
 - OpenAI-compatible `/v1/models`, `/v1/chat/completions`, and `/v1/responses`.
-- No Anthropic Messages compatibility route is a migration target.
-- No Sub2API or CPA client/protocol integration is a migration target. The
-  direct first-party xAI upstream is explicitly configured before Chat or
-  Responses requests are enabled.
+- Anthropic Messages compatibility is intentionally removed rather than delegated to another runtime.
+- No third-party account-push or external auth-directory integration is retained.
+  The direct first-party xAI upstream is explicitly configured before request routes are enabled.
 - Health, readiness, metrics, static admin pages, and every existing
   `/admin/api/*` route.
 - Account import/export, registration, SSO import, device login, maintainer,
@@ -346,7 +344,7 @@ printed by either tool.
    from SQLite at startup.
 3. Implement immediate durable writes for pool failures, quota changes, and
    token replacement; use buffered writes only for telemetry.
-4. Move OpenAI Chat Completions and Responses routes one family at a time through
+4. Move OpenAI Chat Completions and Responses routes through
    fixture tests and a non-production canary.
 
 Exit gate: ordinary and streaming completions preserve response semantics;

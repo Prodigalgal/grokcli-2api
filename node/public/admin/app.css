@@ -73,12 +73,55 @@ dialog header { display: flex; align-items: center; justify-content: space-betwe
 dialog footer { display: flex; justify-content: flex-end; margin-top: 16px; }
 code { display: block; overflow-wrap: anywhere; padding: 12px; color: #f6d48a; background: #0f1417; border: 1px solid #354149; border-radius: 4px; }
 
-@media (max-width: 720px) {
-  .shell { padding: 0 12px 18px; }
-  .topbar { align-items: flex-start; padding: 12px 0; }
-  .top-actions { justify-content: flex-end; }
-  .metrics, .split-grid { grid-template-columns: 1fr 1fr; }
-  .metric { min-height: 80px; }
-  .form-grid { grid-template-columns: 1fr; }
-  .form-grid .wide { grid-column: auto; }
+/* Desktop control plane, aligned with the MiMo-inspired main admin shell. */
+:root {
+  color: #24332b;
+  background: #f6f8f6;
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
 }
+
+body { min-width: 1180px; background: #f6f8f6; }
+button { border-color: #16784a; background: #16784a; color: #fff; border-radius: 5px; }
+button:hover { background: #11683f; }
+button.quiet { background: #fff; border-color: #cbd6cf; color: #425249; }
+input, select { color: #24332b; background: #fff; border-color: #cbd6cf; border-radius: 5px; }
+label { color: #5d6b63; }
+
+.shell { max-width: none; padding: 0 36px 32px; }
+.topbar { min-height: 58px; margin: 0 -36px; padding: 0 36px; background: #fff; border-color: #dce4df; }
+.brand { color: #183d2a; font-size: 17px; }
+.brand span { color: #16784a; background: #e7f4ec; border: 1px solid #bcdcc9; padding: 2px 6px; border-radius: 4px; }
+.state { color: #6b776f; }
+.state.ready { color: #16784a; }
+.state.error, .form-error { color: #c43f3f; }
+
+.login-view { min-height: calc(100vh - 58px); }
+.login-form { width: 360px; padding: 24px; background: #fff; border-color: #d6dfd9; border-radius: 6px; box-shadow: none; }
+.tabs { margin: 0 -36px; padding: 0 36px; background: #fff; border-color: #dce4df; gap: 10px; }
+.tabs button { color: #627068; min-width: 68px; padding: 0 10px; }
+.tabs button.active { color: #16784a; border-bottom-color: #16784a; font-weight: 600; }
+.panel { padding-top: 22px; }
+
+.metric, .tool-surface { background: #fff; border-color: #d6dfd9; border-radius: 6px; }
+.metric { min-height: 86px; padding: 14px 16px; }
+.metric span, th { color: #6c7971; }
+.metric strong { color: #1d3025; font-size: 22px; }
+.summary-list div, th, td { border-color: #e4e9e6; }
+.table-wrap { border-color: #d6dfd9; border-radius: 6px; background: #fff; }
+table { background: #fff; }
+td { color: #2e3b33; }
+tbody tr:hover { background: #f2f7f4; }
+.status { color: #5d6b63; }
+.status.good { color: #16784a; }
+.status.bad { color: #c43f3f; }
+.status.warn { color: #9a6812; }
+
+dialog { color: #26372d; background: #fff; border-color: #aebdb4; border-radius: 6px; }
+dialog::backdrop { background: rgba(24, 38, 30, .4); }
+.dialog-fields textarea { color: #26372d; background: #fff; border-color: #cbd6cf; }
+code { color: #27513a; background: #f3f6f4; border-color: #d6dfd9; }
+.inline-detail { display: inline; padding: 2px 5px; border: 0; background: transparent; color: #5d6b63; }
+.settings-form { max-width: 720px; }
+.settings-form .tool-surface { display: grid; gap: 14px; }
+.settings-form button { width: max-content; }
+.compact-table { min-width: 0; }

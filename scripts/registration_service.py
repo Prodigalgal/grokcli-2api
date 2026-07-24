@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Internal registration + SSO + captcha sidecar for the Go main process.
+"""Internal registration and captcha worker for the Node runtime.
 
-Public API traffic must not hit this service. Go admin facades call:
+Public API traffic must not hit this service. The Node automation worker calls:
 
-  /internal/registration/v1/*   registration machine (mailbox + captcha + device)
-  /internal/sso/v1/*            SSO cookie conversion jobs
+  /internal/registration/v1/*   registration machine (mailbox + captcha)
 
 Python owns:
   - registration orchestration (grok2api.upstream.grok_build_adapter)
   - mailbox providers
   - Turnstile solving via local solver / YesCaptcha
-  - SSO conversion scripts/helpers (scripts/sso_to_auth_json.py)
 
-Captcha browser pool itself is the sibling process turnstile-solver
-(started by entrypoint.sh). This service only consumes it.
+Captcha browser execution can run in the sibling turnstile-solver process.
+This service only consumes it and never owns durable application state.
 """
 
 from __future__ import annotations
@@ -81,16 +79,12 @@ def health() -> dict[str, Any]:
     ).strip().rstrip("/")
     out: dict[str, Any] = {
         "ok": reg is not None,
-        "service": "registration-sso-sidecar",
+        "service": "registration-worker",
         "adapter_error": _IMPORT_ERROR,
         "registration": reg is not None,
-        "sso": True,  # SSO handlers import sso_import helpers lazily
         "captcha_provider": captcha_provider,
         "local_solver_url": local_solver if captcha_provider == "local" else None,
-        "endpoints": {
-            "registration": API_PREFIX,
-            "sso": "/internal/sso/v1", "device": "/internal/device/v1",
-        },
+        "endpoints": {"registration": API_PREFIX},
     }
     if reg is not None:
         try:
@@ -460,201 +454,6 @@ def stop_all(request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
     return _jsonable(adapter.stop_all_active_registrations())
-
-
-# ---------------------------------------------------------------------------
-# Device-code login (Python-owned OIDC). Go admin proxies these endpoints.
-# ---------------------------------------------------------------------------
-DEVICE_PREFIX = "/internal/device/v1"
-
-
-@app.post(f"{DEVICE_PREFIX}/login")
-async def device_login_start(request: Request) -> dict[str, Any]:
-    """Start native OIDC device-code login (no Grok CLI required)."""
-    _require_auth(request)
-    mode = "device"
-    capture = True
-    try:
-        body = await request.json()
-        if isinstance(body, dict):
-            mode = str(body.get("mode") or "device")
-            if "capture" in body:
-                capture = bool(body.get("capture"))
-    except Exception:
-        pass
-    try:
-        from grok2api.pool.accounts import start_login
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
-    try:
-        result = start_login(mode=mode, capture=capture)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"device login failed: {exc}") from exc
-    if not isinstance(result, dict):
-        raise HTTPException(status_code=500, detail="invalid device login response")
-    if result.get("ok") is False:
-        raise HTTPException(status_code=400, detail=str(result.get("error") or "device login failed"))
-    return _jsonable(result)
-
-
-@app.get(f"{DEVICE_PREFIX}/sessions/{{session_id}}")
-def device_login_session(session_id: str, request: Request) -> dict[str, Any]:
-    _require_auth(request)
-    try:
-        from grok2api.pool.accounts import get_login_session
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
-    sess = get_login_session(session_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="device session not found")
-    # Strip secrets from poll response.
-    out = dict(sess) if isinstance(sess, dict) else {}
-    out.pop("device_code", None)
-    out.pop("password", None)
-    out.pop("access_token", None)
-    out.pop("refresh_token", None)
-    out.pop("key", None)
-    return _jsonable(out)
-
-
-@app.get(f"{DEVICE_PREFIX}/sessions")
-def device_login_sessions(request: Request) -> dict[str, Any]:
-    _require_auth(request)
-    try:
-        from grok2api.pool.accounts import list_login_sessions
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
-    items = list_login_sessions() or []
-    cleaned = []
-    for sess in items:
-        if not isinstance(sess, dict):
-            continue
-        row = dict(sess)
-        row.pop("device_code", None)
-        row.pop("password", None)
-        row.pop("access_token", None)
-        row.pop("refresh_token", None)
-        row.pop("key", None)
-        cleaned.append(row)
-    return _jsonable({"ok": True, "sessions": cleaned, "count": len(cleaned)})
-
-
-# ---------------------------------------------------------------------------
-# SSO conversion (Python-owned). Go admin only proxies these endpoints.
-# ---------------------------------------------------------------------------
-SSO_PREFIX = "/internal/sso/v1"
-
-
-@app.post(f"{SSO_PREFIX}/import")
-async def sso_import_start(request: Request) -> dict[str, Any]:
-    """Start async SSO cookie import using existing Python helpers/scripts."""
-    _require_auth(request)
-    try:
-        body = await request.json()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"invalid JSON: {exc}") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="body must be object")
-
-    # Reuse sso_import helpers so conversion stays in original language/script path.
-    try:
-        from grok2api.admin import sso_import as ar
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"sso import helpers unavailable: {exc}") from exc
-
-    cookies = body.get("sso_cookies") or body.get("cookies") or []
-    if isinstance(cookies, str):
-        cookies = [cookies]
-    if not isinstance(cookies, list):
-        raise HTTPException(status_code=400, detail="sso_cookies must be list or string")
-    sso_items = ar._parse_sso_lines([str(x) for x in cookies])
-    if not sso_items:
-        raise HTTPException(status_code=400, detail="No valid SSO cookies provided")
-
-    merge = bool(body.get("merge", True))
-    try:
-        delay = int(body.get("delay") or 0)
-    except Exception:
-        delay = 0
-    try:
-        max_workers = int(body.get("max_workers") or 8)
-    except Exception:
-        max_workers = 8
-
-    import threading
-    import time
-    import uuid
-
-    try:
-        from grok2api.config import SSO_IMPORT_WORKERS
-    except Exception:
-        SSO_IMPORT_WORKERS = 8
-    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)), 12)
-    if delay and delay >= 2:
-        workers = min(workers, 2)
-
-    job_id = f"sso_{uuid.uuid4().hex[:16]}"
-    now = time.time()
-    job = {
-        "id": job_id,
-        "status": "queued",
-        "phase": "queued",
-        "message": f"已排队，共 {len(sso_items)} 条 SSO",
-        "total": len(sso_items),
-        "done": 0,
-        "success": 0,
-        "fail": 0,
-        "converted": 0,
-        "percent": 0,
-        "workers": workers,
-        "delay": int(delay or 0),
-        "merge": bool(merge),
-        "created_at": now,
-        "updated_at": now,
-        "finished_at": None,
-        "results": [],
-        "imported": [],
-        "error": None,
-        "ok": None,
-    }
-    ar._sso_job_put(job_id, job)
-    t = threading.Thread(
-        target=ar._run_sso_import_job,
-        kwargs={
-            "job_id": job_id,
-            "sso_items": sso_items,
-            "merge": bool(merge),
-            "delay": int(delay or 0),
-            "max_workers": int(max_workers or workers),
-        },
-        daemon=True,
-        name=f"sso-import-job-{job_id[-8:]}",
-    )
-    t.start()
-    return {
-        "ok": True,
-        "async": True,
-        "job_id": job_id,
-        "status": "queued",
-        "total": len(sso_items),
-        "workers": workers,
-        "delay": int(delay or 0),
-        "message": f"SSO 导入已启动（{len(sso_items)} 条，workers={workers}）",
-        "poll_url": f"/admin/api/accounts/import-sso/jobs/{job_id}",
-    }
-
-
-@app.get(f"{SSO_PREFIX}/jobs/{{job_id}}")
-def sso_import_job(job_id: str, request: Request) -> dict[str, Any]:
-    _require_auth(request)
-    try:
-        from grok2api.admin import sso_import as ar
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"sso import helpers unavailable: {exc}") from exc
-    job = ar._sso_job_get(str(job_id or "").strip())
-    if not job:
-        raise HTTPException(status_code=404, detail="SSO import job not found")
-    return ar._sso_public_job(job)
 
 
 @app.exception_handler(HTTPException)

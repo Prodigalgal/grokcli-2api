@@ -14,6 +14,7 @@ import { openAiModelList, type ModelStore } from "../models/catalog.js";
 import { buildResponseObject, ResponsesLiveEncoder, responsesToChatBody } from "../protocol/openai-responses.js";
 import { UpstreamError } from "../upstream/responses-client.js";
 import type { SqliteStore } from "../storage/sqlite-store.js";
+import type { TokenMaintainer } from "../maintainer/service.js";
 
 export interface HealthServer {
   listen(host: string, port: number): Promise<number>;
@@ -38,6 +39,7 @@ export interface ApiServerOptions {
   readonly adminStore?: SqliteStore | null;
   readonly adminUsername?: string | null;
   readonly adminPassword?: string | null;
+  readonly maintainer?: Pick<TokenMaintainer, "runOnce"> | null;
 }
 
 function statusFor(error: unknown): number {
@@ -54,6 +56,10 @@ function requestBody(request: FastifyRequest): Record<string, unknown> {
     throw new Error("request body must be a JSON object");
   }
   return body as Record<string, unknown>;
+}
+
+function stringField(value: Record<string, unknown>, key: string): string {
+  return typeof value[key] === "string" ? value[key].trim() : "";
 }
 
 function withGrokConversationHint(request: FastifyRequest, body: Record<string, unknown>): Record<string, unknown> {
@@ -124,7 +130,7 @@ function adminAsset(name: "index.html" | "app.css" | "app.js"): string {
 export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   const modelStore = options.modelStore ?? null;
   const apiKeyStore = options.apiKeyStore ?? null;
-  const defaultModel = options.defaultModel?.trim() || "grok-4.5";
+  let defaultModel = options.defaultModel?.trim() || "grok-4.5";
   const apiKeyAuth: ApiKeyAuthConfig = options.apiKeyAuth ?? { legacyApiKey: null, requireApiKey: "auto" };
   const chatService = options.chatService ?? null;
   const deviceLogins = options.deviceLogins ?? null;
@@ -134,6 +140,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   const adminStore = options.adminStore ?? null;
   const adminUsername = options.adminUsername?.trim() || null;
   const adminPassword = options.adminPassword?.trim() || null;
+  const maintainer = options.maintainer ?? null;
   const app = Fastify({
     bodyLimit: 8 * 1024 * 1024,
     logger: false,
@@ -159,9 +166,24 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   };
   app.get("/ready", readiness);
   app.get("/health", readiness);
+  app.get("/metrics", async (_request, reply) => {
+    const pool = adminStore?.poolSummary();
+    const usage = adminStore?.usageSummary().total;
+    const lines = [
+      "# TYPE grok2api_accounts gauge",
+      `grok2api_accounts ${pool?.total ?? 0}`,
+      "# TYPE grok2api_accounts_live gauge",
+      `grok2api_accounts_live ${pool?.live ?? 0}`,
+      "# TYPE grok2api_requests_total counter",
+      `grok2api_requests_total ${usage?.requests ?? 0}`,
+      "# TYPE grok2api_tokens_total counter",
+      `grok2api_tokens_total ${usage?.totalTokens ?? 0}`,
+    ];
+    return reply.type("text/plain; version=0.0.4; charset=utf-8").header("cache-control", "no-store").send(`${lines.join("\n")}\n`);
+  });
 
   app.get("/", async (_request, reply) => reply.redirect("/admin"));
-  for (const path of ["/admin", "/admin/"]) {
+  for (const path of ["/admin", "/admin/", "/admin/accounts", "/admin/keys", "/admin/models", "/admin/usage", "/admin/logs", "/admin/settings"]) {
     app.get(path, async (_request, reply) => reply.type("text/html; charset=utf-8").header("cache-control", "no-store").send(adminAsset("index.html")));
   }
   app.get("/admin/app.css", async (_request, reply) => reply.type("text/css; charset=utf-8").header("cache-control", "public, max-age=300").send(adminAsset("app.css")));
@@ -233,6 +255,102 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       return reply;
     }
     return reply.header("cache-control", "no-store").send({ ok: true, ...store.usageSummary(), storage: "sqlite" });
+  });
+
+  app.post("/admin/api/models/save", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const body = requestBody(request);
+    const values = Array.isArray(body.models) ? body.models : Array.isArray(body.data) ? body.data : [];
+    const models = values.flatMap((value, index) => {
+      if (!value || Array.isArray(value) || typeof value !== "object") return [];
+      const model = value as Record<string, unknown>;
+      const id = stringField(model, "id");
+      if (!id) return [];
+      return [{ id, name: stringField(model, "name") || null, description: stringField(model, "description") || null, ownedBy: stringField(model, "owned_by") || "xai", hidden: model.hidden === true, contextWindow: typeof model.context_window === "number" ? model.context_window : null, supportsReasoningEffort: typeof model.supports_reasoning_effort === "boolean" ? model.supports_reasoning_effort : null, extra: model, sortOrder: index }];
+    });
+    return reply.header("cache-control", "no-store").send({ ok: true, saved: store.replaceModels(models), data: openAiModelList(store, defaultModel).data });
+  });
+  for (const path of ["/admin/api/models/sync", "/admin/api/models/fetch"]) {
+    app.post(path, async (request, reply) => {
+      const store = requireAdminStore(request, reply); if (!store) return reply;
+      const current = openAiModelList(store, defaultModel);
+      return reply.header("cache-control", "no-store").send({ ok: true, synced: store.countModels(), data: current.data, source: "sqlite" });
+    });
+  }
+  app.get("/admin/api/model-health", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    return reply.header("cache-control", "no-store").send({ ok: true, enabled: true, pool: store.poolSummary(), models: store.listPublicModels(), job: null });
+  });
+  app.get("/admin/api/upstream-status", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return reply;
+    const configured = chatService?.isUpstreamConfigured() ?? false;
+    return reply.code(configured ? 200 : 503).header("cache-control", "no-store").send({ ok: configured, reachable: configured, configured, detail: configured ? "upstream configured" : "direct xAI upstream is not configured" });
+  });
+
+  app.get("/admin/api/dashboard", async (request, reply) => {
+    const store = requireAdminStore(request, reply);
+    if (!store) return reply;
+    const keys = store.listApiKeySummaries();
+    const pool = store.poolSummary();
+    return reply.header("cache-control", "no-store").send({
+      ok: true,
+      accounts: { account_count: store.countAccounts(), active_count: pool.live },
+      pool,
+      models_count: store.countModels(),
+      keys: { total: keys.length, enabled: keys.filter((key) => key.enabled).length },
+      usage: store.usageSummary(),
+      store: { backend: "sqlite", redis: false, postgresql: false },
+    });
+  });
+
+  app.get("/admin/api/usage/series", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const raw = (request.query as { days?: unknown }).days;
+    const days = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : 14;
+    return reply.header("cache-control", "no-store").send({ ok: true, series: store.usageSeries(days) });
+  });
+  for (const [path, dimension] of [["/admin/api/usage/by-key", "api_key_id"], ["/admin/api/usage/by-account", "account_id"], ["/admin/api/usage/by-model", "model"]] as const) {
+    app.get(path, async (request, reply) => {
+      const store = requireAdminStore(request, reply); if (!store) return reply;
+      return reply.header("cache-control", "no-store").send({ ok: true, items: store.usageBreakdown(dimension) });
+    });
+  }
+  app.get("/admin/api/usage/events", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const raw = (request.query as { limit?: unknown }).limit;
+    const limit = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : 100;
+    return reply.header("cache-control", "no-store").send({ ok: true, events: store.usageEvents(limit) });
+  });
+
+  app.get("/admin/api/settings", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    return reply.header("cache-control", "no-store").send({ ok: true, settings: store.listSettings(), runtime: { default_model: defaultModel } });
+  });
+  for (const method of ["put", "patch"] as const) {
+    app[method]("/admin/api/settings", async (request, reply) => {
+      const store = requireAdminStore(request, reply); if (!store) return reply;
+      const body = requestBody(request);
+      const settings = body.settings && !Array.isArray(body.settings) && typeof body.settings === "object" ? body.settings as Record<string, unknown> : body;
+      const forbidden = Object.keys(settings).find((key) => /sub2api|cliproxy|cpa/i.test(key));
+      if (forbidden) return reply.code(400).header("cache-control", "no-store").send({ detail: `removed integration setting is not supported: ${forbidden}` });
+      const nextDefault = settings.default_model === undefined ? undefined : typeof settings.default_model === "string" && settings.default_model.trim() ? settings.default_model.trim() : null;
+      const nextMode = settings.account_mode === undefined ? undefined : typeof settings.account_mode === "string" && ["round_robin", "least_used", "random"].includes(settings.account_mode) ? settings.account_mode as "round_robin" | "least_used" | "random" : null;
+      if (nextDefault === null || nextMode === null) return reply.code(400).header("cache-control", "no-store").send({ detail: "default_model or account_mode is invalid" });
+      if (nextDefault) defaultModel = nextDefault;
+      chatService?.updateRuntime({ ...(nextDefault ? { defaultModel: nextDefault } : {}), ...(nextMode ? { poolMode: nextMode } : {}) });
+      return reply.header("cache-control", "no-store").send({ ok: true, updated: store.updateSettings(settings), settings: store.listSettings() });
+    });
+  }
+  app.get("/admin/api/logs", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const raw = (request.query as { limit?: unknown }).limit;
+    const limit = typeof raw === "string" && /^\d+$/.test(raw) ? Number(raw) : 100;
+    return reply.header("cache-control", "no-store").send({ ok: true, logs: store.listOperationalLogs(limit) });
+  });
+  app.get("/admin/api/logs/actions", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const actions = [...new Set(store.listOperationalLogs(500).map((entry) => entry.type))].sort();
+    return reply.header("cache-control", "no-store").send({ ok: true, actions });
   });
 
   app.get("/admin/api/accounts", async (request, reply) => {
@@ -493,6 +611,97 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     }));
     return reply.code(202).header("cache-control", "no-store").send({ ok: true, tasks: tasks.map(publicTask), count: tasks.length });
   });
+
+  for (const method of ["patch", "post"] as const) {
+    app[method]("/admin/api/accounts/:id/status", async (request, reply) => {
+      const store = requireAdminStore(request, reply); if (!store) return reply;
+      const id = (request.params as { id?: string }).id?.trim() || "";
+      if (!store.getAccountSummary(id)) return reply.code(404).send({ detail: "account was not found" });
+      const body = requestBody(request);
+      const status = typeof body.status === "string" ? body.status.trim() : "";
+      if (!["active", "disabled", "normal"].includes(status)) return reply.code(400).send({ detail: "status must be active or disabled" });
+      store.updatePoolEligibility(id, { enabled: status !== "disabled", ...(status === "disabled" ? {} : { cooldownUntil: null }) });
+      return reply.header("cache-control", "no-store").send({ ok: true, account: store.getAccountSummary(id) });
+    });
+  }
+  app.post("/admin/api/accounts/:id/kick", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const id = (request.params as { id?: string }).id?.trim() || "";
+    if (!store.getAccountSummary(id)) return reply.code(404).send({ detail: "account was not found" });
+    store.updatePoolEligibility(id, { enabled: false });
+    return reply.header("cache-control", "no-store").send({ ok: true, account: store.getAccountSummary(id) });
+  });
+  app.get("/admin/api/accounts/export", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    return reply.header("content-disposition", "attachment; filename=auth.json").header("cache-control", "no-store").send({ source: "grok2api-node", exported_at: Date.now(), auth: store.exportAccounts() });
+  });
+  app.post("/admin/api/accounts/import", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const body = requestBody(request);
+    const rawAuth = body.auth && !Array.isArray(body.auth) && typeof body.auth === "object" ? body.auth as Record<string, unknown> : body;
+    let imported = 0;
+    for (const [fallbackId, raw] of Object.entries(rawAuth)) {
+      if (!raw || Array.isArray(raw) || typeof raw !== "object") continue;
+      const payload = raw as Record<string, unknown>;
+      const id = stringField(payload, "id") || stringField(payload, "user_id") || stringField(payload, "principal_id") || fallbackId;
+      if (!id.trim()) continue;
+      const expiresRaw = payload.expires_at;
+      const expiresAt = typeof expiresRaw === "number" && Number.isFinite(expiresRaw) ? Math.trunc(expiresRaw < 10_000_000_000 ? expiresRaw * 1000 : expiresRaw) : null;
+      store.saveAccount({ id, email: stringField(payload, "email") || null, userId: stringField(payload, "user_id") || stringField(payload, "principal_id") || null, teamId: stringField(payload, "team_id") || null, payload, expiresAt });
+      imported++;
+    }
+    return reply.header("cache-control", "no-store").send({ ok: true, imported, total: store.countAccounts() });
+  });
+
+  app.post("/admin/api/accounts/:id/probe", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    if (!chatService) return reply.code(503).send({ detail: "chat service unavailable" });
+    const id = (request.params as { id?: string }).id?.trim() || "";
+    if (!store.getAccountSummary(id)) return reply.code(404).send({ detail: "account was not found" });
+    const body = requestBody(request);
+    const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : defaultModel;
+    try {
+      return reply.header("cache-control", "no-store").send(await chatService.probeAccount(id, model));
+    } catch (error) {
+      return reply.code(statusFor(error)).header("cache-control", "no-store").send({ ok: false, account_id: id, error: messageFor(error) });
+    }
+  });
+  app.post("/admin/api/accounts/probe-batch", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    if (!chatService) return reply.code(503).send({ detail: "chat service unavailable" });
+    const body = requestBody(request);
+    const ids = Array.isArray(body.ids) ? body.ids.filter((value): value is string => typeof value === "string" && Boolean(value.trim())).map((value) => value.trim()) : [];
+    const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : defaultModel;
+    const results = [];
+    for (const id of ids.slice(0, 100)) {
+      try { results.push(await chatService.probeAccount(id, model)); }
+      catch (error) { results.push({ ok: false, accountId: id, model, error: messageFor(error) }); }
+    }
+    return reply.header("cache-control", "no-store").send({ ok: results.every((result) => result.ok), results, total: results.length });
+  });
+  app.post("/admin/api/accounts/probe-all", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    if (!chatService) return reply.code(503).send({ detail: "chat service unavailable" });
+    const ids = store.listAccountSummaries({ page: 1, pageSize: 500 }).accounts.filter((account) => account.enabled).map((account) => account.id);
+    const results = [];
+    for (const id of ids) {
+      try { results.push(await chatService.probeAccount(id, defaultModel)); }
+      catch (error) { results.push({ ok: false, accountId: id, model: defaultModel, error: messageFor(error) }); }
+    }
+    return reply.header("cache-control", "no-store").send({ ok: results.every((result) => result.ok), results, total: results.length, done: true });
+  });
+
+  app.get("/admin/api/maintainer", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return reply;
+    return reply.header("cache-control", "no-store").send({ ok: true, available: maintainer !== null });
+  });
+  for (const path of ["/admin/api/maintainer/run", "/admin/api/accounts/refresh"]) {
+    app.post(path, async (request, reply) => {
+      if (!requireAdmin(request, reply)) return reply;
+      if (!maintainer) return reply.code(503).send({ detail: "token maintainer is unavailable" });
+      return reply.header("cache-control", "no-store").send({ ok: true, result: await maintainer.runOnce(true) });
+    });
+  }
   app.post("/admin/api/accounts/:id/email-login", async (request, reply) => {
     const store = requireAdminStore(request, reply);
     if (!store) {

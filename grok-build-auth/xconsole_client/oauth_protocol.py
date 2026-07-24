@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Protocolized xAI OAuth login (no browser) for Grok Build / CLIProxyAPI.
+"""Protocolized xAI OAuth login without a browser.
 
 After account signup (or with email/password), this module:
 
@@ -8,7 +8,7 @@ After account signup (or with email/password), this module:
   3. Solves Cloudflare Turnstile via YesCaptcha
   4. Calls auth_mgmt.AuthManagement/CreateSession (gRPC-web)
   5. Follows cookieSetterUrl + OAuth redirects to capture authorization code
-  6. Exchanges code for tokens and exports CLIProxyAPI Grok Build auth JSON
+  6. Exchanges the authorization code for xAI OAuth tokens
 
 CreateSessionRequest wire layout (reverse-engineered 2026-07):
 
@@ -32,7 +32,6 @@ from . import grpcweb
 from .solver import YesCaptchaSolver
 from .xai_oauth import (
     AUTHORIZATION_ENDPOINT,
-    CLIPROXYAPI_GROK_BASE_URL,
     DEFAULT_CLIENT_ID,
     DEFAULT_SCOPES,
     OAuthLoginResult,
@@ -565,9 +564,6 @@ class ProtocolOAuthClient:
         redirect_host: str = "127.0.0.1",
         redirect_port: int = 56121,
         output_dir: Optional[str] = None,
-        cliproxyapi_auth_dir: Optional[str] = None,
-        cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
-        cliproxyapi_disabled: bool = False,
         proxy: str = "",
         session_cookies: Optional[Dict[str, str]] = None,
     ) -> OAuthLoginResult:
@@ -793,9 +789,6 @@ class ProtocolOAuthClient:
             client_id=client_id,
             proxy=proxy,
             output_dir=output_dir,
-            cliproxyapi_auth_dir=cliproxyapi_auth_dir,
-            cliproxyapi_base_url=cliproxyapi_base_url,
-            cliproxyapi_disabled=cliproxyapi_disabled,
         )
 
 
@@ -807,15 +800,12 @@ def login_with_protocol(
     proxy: str = "",
     debug: bool = False,
     turnstile_premium: bool = True,
-    cliproxyapi_auth_dir: Optional[str] = None,
-    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
-    cliproxyapi_disabled: bool = False,
     output_dir: Optional[str] = None,
     redirect_port: int = 56121,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
 ) -> OAuthLoginResult:
-    """Convenience wrapper: protocol OAuth + optional CLIProxyAPI Build export.
+    """Complete the protocol OAuth flow and persist the OAuth record.
 
     If *auth_client* (XConsoleAuthClient) is provided after signup, its live
     curl_cffi session is reused so accounts.x.ai cookies stay attached.
@@ -840,9 +830,6 @@ def login_with_protocol(
     return client.login(
         email,
         password,
-        cliproxyapi_auth_dir=cliproxyapi_auth_dir,
-        cliproxyapi_base_url=cliproxyapi_base_url,
-        cliproxyapi_disabled=cliproxyapi_disabled,
         output_dir=output_dir,
         redirect_port=redirect_port,
         proxy=proxy,

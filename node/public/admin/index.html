@@ -2,10 +2,10 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="viewport" content="width=1180">
+    <meta name="color-scheme" content="light">
     <title>grok2api</title>
-    <link rel="stylesheet" href="/admin/app.css">
+    <link rel="stylesheet" href="/admin/app.css?v=20260724">
   </head>
   <body>
     <main class="shell">
@@ -32,8 +32,12 @@
           <button type="button" data-tab="overview" class="active">概览</button>
           <button type="button" data-tab="accounts">账号</button>
           <button type="button" data-tab="keys">密钥</button>
+          <button type="button" data-tab="models">模型</button>
           <button type="button" data-tab="device">设备登录</button>
           <button type="button" data-tab="tasks">自动化</button>
+          <button type="button" data-tab="usage">用量</button>
+          <button type="button" data-tab="logs">日志</button>
+          <button type="button" data-tab="settings">设置</button>
         </nav>
 
         <section id="overview-panel" data-panel="overview" class="panel active">
@@ -46,6 +50,9 @@
 
         <section data-panel="accounts" class="panel">
           <div class="toolbar">
+            <button id="account-import" type="button">导入 JSON</button>
+            <button id="account-export" type="button" class="quiet">导出账号</button>
+            <button id="maintainer-run" type="button" class="quiet">立即续期</button>
             <label class="search">筛选账号<input id="account-query" type="search" placeholder="账号 ID、邮箱或用户 ID"></label>
             <select id="account-status"><option value="">全部状态</option><option value="active">可用</option><option value="disabled">已停用</option><option value="quota_disabled">额度停用</option><option value="cooldown">冷却中</option><option value="expired">已过期</option></select>
             <button id="account-search" type="button">查询</button>
@@ -72,6 +79,30 @@
           </div>
           <div class="table-wrap"><table><thead><tr><th>类型</th><th>状态</th><th>尝试</th><th>更新时间</th><th>日志</th><th></th></tr></thead><tbody id="tasks-body"></tbody></table></div>
         </section>
+
+        <section data-panel="models" class="panel">
+          <div class="toolbar"><button id="models-sync" type="button">同步模型</button></div>
+          <div class="table-wrap"><table><thead><tr><th>模型 ID</th><th>名称</th><th>所有者</th><th>上下文</th><th>推理强度</th></tr></thead><tbody id="models-body"></tbody></table></div>
+        </section>
+
+        <section data-panel="usage" class="panel">
+          <div id="usage-metrics" class="metrics"></div>
+          <div class="split-grid">
+            <section class="tool-surface"><h2>近 14 天</h2><div id="usage-series" class="table-wrap"></div></section>
+            <section class="tool-surface"><h2>按模型</h2><div id="usage-models" class="table-wrap"></div></section>
+          </div>
+        </section>
+
+        <section data-panel="logs" class="panel">
+          <div class="toolbar"><button id="logs-refresh" type="button">刷新日志</button></div>
+          <div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>状态</th><th>详情</th></tr></thead><tbody id="logs-body"></tbody></table></div>
+        </section>
+
+        <section data-panel="settings" class="panel">
+          <form id="settings-form" class="settings-form">
+            <section class="tool-surface"><h2>运行设置</h2><label>默认模型<input id="setting-default-model" name="default_model" placeholder="grok-4.5"></label><label>账号调度<select id="setting-account-mode" name="account_mode"><option value="round_robin">轮询</option><option value="least_used">最少使用</option><option value="random">随机</option></select></label><button type="submit">保存设置</button></section>
+          </form>
+        </section>
       </section>
     </main>
 
@@ -84,6 +115,6 @@
       </form>
     </dialog>
     <dialog id="secret-dialog"><form method="dialog"><header><h2>新 API Key</h2><button type="submit" class="quiet">关闭</button></header><code id="issued-secret"></code><footer><button id="copy-secret" type="button">复制</button></footer></form></dialog>
-    <script type="module" src="/admin/app.js"></script>
+    <script type="module" src="/admin/app.js?v=20260724"></script>
   </body>
 </html>

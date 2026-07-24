@@ -1,4 +1,6 @@
-const state = { username: sessionStorage.getItem("grok2api-admin-username") || "admin", password: sessionStorage.getItem("grok2api-admin-password") || "", tab: "overview", accountPage: 1 };
+const pathTab = location.pathname.split("/").filter(Boolean).at(-1);
+const initialTab = ["accounts", "keys", "models", "usage", "logs", "settings"].includes(pathTab) ? pathTab : "overview";
+const state = { username: sessionStorage.getItem("grok2api-admin-username") || "admin", password: sessionStorage.getItem("grok2api-admin-password") || "", tab: initialTab, accountPage: 1 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -53,7 +55,12 @@ async function loadOverview() {
   ];
   $("#overview-grid").innerHTML = metrics.map(([name, value]) => `<div class="metric"><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   $("#pool-summary").innerHTML = summary(data.pool, { total: "总数", live: "可用", disabled: "停用", quotaDisabled: "额度停用", cooldown: "冷却", expired: "过期" });
-  $("#usage-summary").innerHTML = summary(data.usage, { requests: "请求", success: "成功", fail: "失败", totalTokens: "Token" });
+  $("#usage-summary").innerHTML = summary(data.usage?.today || data.usage, { requests: "今日请求", success: "成功", fail: "失败", totalTokens: "今日 Token" });
+  setConnection(data.direct_xai?.configured ? "已连接" : "缺少上游", data.direct_xai?.configured ? "ready" : "error");
+}
+
+async function loadConnection() {
+  const data = await api("/admin/api/status");
   setConnection(data.direct_xai?.configured ? "已连接" : "缺少上游", data.direct_xai?.configured ? "ready" : "error");
 }
 
@@ -101,6 +108,40 @@ async function loadTasks() {
   $$('[data-task-detail]').forEach((button) => button.addEventListener("click", () => void showTaskDetail(button.dataset.taskDetail)));
 }
 
+async function loadModels() {
+  const data = await api("/admin/api/models");
+  $("#models-body").innerHTML = (data.data || []).map((model) => `<tr><td><strong>${escapeHtml(model.id)}</strong></td><td>${escapeHtml(model.name || "-")}</td><td>${escapeHtml(model.owned_by || "xai")}</td><td>${escapeHtml(model.context_window || "-")}</td><td>${model.supports_reasoning_effort ? status("active") : "-"}</td></tr>`).join("") || `<tr><td colspan="5">暂无模型</td></tr>`;
+}
+
+async function loadUsage() {
+  const [summaryData, seriesData, modelData] = await Promise.all([
+    api("/admin/api/usage/summary"),
+    api("/admin/api/usage/series?days=14"),
+    api("/admin/api/usage/by-model"),
+  ]);
+  const total = summaryData.total || {};
+  const today = summaryData.today || {};
+  const metrics = [["今日请求", today.requests || 0], ["今日 Token", today.totalTokens || 0], ["累计请求", total.requests || 0], ["累计 Token", total.totalTokens || 0]];
+  $("#usage-metrics").innerHTML = metrics.map(([name, value]) => `<div class="metric"><span>${escapeHtml(name)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+  $("#usage-series").innerHTML = compactTable(["日期", "请求", "成功", "Token"], (seriesData.series || []).map((row) => [row.day, row.requests, row.success, row.totalTokens]));
+  $("#usage-models").innerHTML = compactTable(["模型", "请求", "成功", "Token"], (modelData.items || []).map((row) => [row.id, row.requests, row.success, row.totalTokens]));
+}
+
+async function loadLogs() {
+  const data = await api("/admin/api/logs?limit=200");
+  $("#logs-body").innerHTML = (data.logs || []).map((entry) => `<tr><td>${date(entry.createdAt)}</td><td>${escapeHtml(entry.type)}</td><td>${status(entry.status)}</td><td><code class="inline-detail">${escapeHtml(entry.detail?.error || entry.detail?.message || "-")}</code></td></tr>`).join("") || `<tr><td colspan="4">暂无运行日志</td></tr>`;
+}
+
+async function loadSettings() {
+  const data = await api("/admin/api/settings");
+  $("#setting-default-model").value = data.settings?.default_model || data.runtime?.default_model || "grok-4.5";
+  $("#setting-account-mode").value = data.settings?.account_mode || "round_robin";
+}
+
+function compactTable(headers, rows) {
+  return `<table class="compact-table"><thead><tr>${headers.map((name) => `<th>${escapeHtml(name)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((value) => `<td>${escapeHtml(value)}</td>`).join("")}</tr>`).join("") || `<tr><td colspan="${headers.length}">暂无数据</td></tr>`}</tbody></table>`;
+}
+
 async function showTaskDetail(id) {
   const data = await api(`/admin/api/automation/tasks/${encodeURIComponent(id)}`);
   const rows = data.events.map((event) => `<tr><td>${date(event.createdAt)}</td><td>${escapeHtml(event.type)}</td><td>${escapeHtml(event.detail?.message || event.detail?.error || "-")}</td></tr>`).join("") || `<tr><td colspan="3">暂无日志</td></tr>`;
@@ -112,8 +153,12 @@ async function loadTab() {
     if (state.tab === "overview") await loadOverview();
     if (state.tab === "accounts") await loadAccounts();
     if (state.tab === "keys") await loadKeys();
+    if (state.tab === "models") await loadModels();
     if (state.tab === "device") await loadDevices();
     if (state.tab === "tasks") await loadTasks();
+    if (state.tab === "usage") await loadUsage();
+    if (state.tab === "logs") await loadLogs();
+    if (state.tab === "settings") await loadSettings();
   } catch (error) { setConnection(error.message || "连接失败", "error"); }
 }
 
@@ -148,14 +193,15 @@ $("#login-form").addEventListener("submit", async (event) => {
   state.username = $("#admin-username").value.trim();
   state.password = $("#admin-password").value;
   try {
-    await api("/admin/api/status");
+    const status = await api("/admin/api/status");
     sessionStorage.setItem("grok2api-admin-username", state.username);
     sessionStorage.setItem("grok2api-admin-password", state.password);
-    $("#login-view").hidden = true; $("#app-view").hidden = false; await loadTab();
+    setConnection(status.direct_xai?.configured ? "已连接" : "缺少上游", status.direct_xai?.configured ? "ready" : "error");
+    $("#login-view").hidden = true; $("#app-view").hidden = false; showTab(state.tab);
   } catch (error) { const message = $("#login-error"); message.textContent = error.message || "认证失败"; message.hidden = false; }
 });
 $("#logout-button").addEventListener("click", () => { sessionStorage.removeItem("grok2api-admin-username"); sessionStorage.removeItem("grok2api-admin-password"); state.password = ""; $("#app-view").hidden = true; $("#login-view").hidden = false; setConnection("未连接"); });
-$("#refresh-button").addEventListener("click", () => void loadTab());
+$("#refresh-button").addEventListener("click", () => { void loadConnection(); void loadTab(); });
 $$('[data-tab]').forEach((button) => button.addEventListener("click", () => showTab(button.dataset.tab)));
 $("#account-search").addEventListener("click", () => { state.accountPage = 1; void loadAccounts(); });
 $("#device-start").addEventListener("click", () => void startDeviceLogin());
@@ -163,6 +209,23 @@ $("#device-start-secondary").addEventListener("click", () => void startDeviceLog
 $("#key-create").addEventListener("click", () => dialog("创建 API Key", `<label>名称<input name="name" required maxlength="120"></label><label>备注<input name="note" maxlength="1000"></label>`, async (form) => { const data = await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ name: form.get("name"), note: form.get("note") }) }); showSecret(data.secret); }));
 $("#registration-start").addEventListener("click", () => void registrationDialog());
 $("#automation-start").addEventListener("click", () => browserTaskDialog("浏览器任务", "/admin/api/automation/browser"));
+$("#models-sync").addEventListener("click", async () => { await api("/admin/api/models/sync", { method: "POST" }); await loadModels(); });
+$("#logs-refresh").addEventListener("click", () => void loadLogs());
+$("#maintainer-run").addEventListener("click", async () => { await api("/admin/api/maintainer/run", { method: "POST" }); await loadAccounts(); });
+$("#account-export").addEventListener("click", async () => {
+  const payload = await api("/admin/api/accounts/export");
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+  const link = document.createElement("a"); link.href = url; link.download = "auth.json"; link.click(); URL.revokeObjectURL(url);
+});
+$("#account-import").addEventListener("click", () => dialog("导入账号 JSON", `<label>auth.json 内容<textarea name="payload" required placeholder='{ "auth": { ... } }'></textarea></label>`, async (form) => {
+  const payload = JSON.parse(String(form.get("payload") || "{}"));
+  await api("/admin/api/accounts/import", { method: "POST", body: JSON.stringify(payload) });
+}));
+$("#settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await api("/admin/api/settings", { method: "PATCH", body: JSON.stringify({ settings: { default_model: $("#setting-default-model").value.trim(), account_mode: $("#setting-account-mode").value } }) });
+  setConnection("设置已保存", "ready");
+});
 $("#copy-secret").addEventListener("click", async () => { await navigator.clipboard.writeText($("#issued-secret").textContent || ""); });
 
 function browserTaskDialog(title, endpoint) {

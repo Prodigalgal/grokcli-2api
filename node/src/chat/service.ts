@@ -139,8 +139,8 @@ export class ChatService {
   constructor(
     private readonly store: ChatPoolStore,
     upstreamBase: string | null,
-    private readonly defaultModel: string,
-    private readonly poolMode: PoolMode,
+    private defaultModel: string,
+    private poolMode: PoolMode,
     private readonly usage?: UsageSink | null,
   ) {
     this.upstream = upstreamBase ? new ResponsesClient(upstreamBase) : null;
@@ -148,6 +148,30 @@ export class ChatService {
 
   isUpstreamConfigured(): boolean {
     return this.upstream !== null;
+  }
+
+  updateRuntime(settings: { readonly defaultModel?: string; readonly poolMode?: PoolMode }): void {
+    if (settings.defaultModel?.trim()) this.defaultModel = settings.defaultModel.trim();
+    if (settings.poolMode) this.poolMode = settings.poolMode;
+  }
+
+  async probeAccount(accountId: string, model = this.defaultModel, signal?: AbortSignal): Promise<{ readonly ok: true; readonly accountId: string; readonly model: string }> {
+    const candidate = this.store.listPoolCandidates().find((item) => item.id === accountId);
+    if (!candidate) throw new Error("account is not eligible for probing");
+    if (!this.upstream) throw new UpstreamError(503, "direct xAI upstream is not configured");
+    try {
+      const response = await this.upstream.openChat(candidate, model, { messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 1, _skip_x_search: true }, signal);
+      const reader = response.body?.getReader();
+      if (reader) {
+        await reader.read();
+        await reader.cancel();
+      }
+      this.store.reportPoolSuccess(accountId);
+      return { ok: true, accountId, model };
+    } catch (error) {
+      this.store.reportPoolFailure(accountId, error instanceof Error ? error.message : "probe failed");
+      throw error;
+    }
   }
 
   async complete(body: Record<string, unknown>, context: ChatExecutionContext = {}, signal?: AbortSignal): Promise<ChatCompletion> {

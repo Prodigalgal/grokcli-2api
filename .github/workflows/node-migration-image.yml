@@ -1,16 +1,28 @@
-name: Build Node migration image
+name: Build Node service image
 
 on:
   push:
     branches: [main]
     paths:
+      - "Dockerfile"
       - "node/**"
+      - "grok2api/**"
+      - "grok-build-auth/**"
+      - "scripts/**"
+      - "turnstile-solver/**"
+      - "requirements.txt"
       - ".github/workflows/node-migration-image.yml"
       - ".dockerignore"
   pull_request:
     branches: [main]
     paths:
+      - "Dockerfile"
       - "node/**"
+      - "grok2api/**"
+      - "grok-build-auth/**"
+      - "scripts/**"
+      - "turnstile-solver/**"
+      - "requirements.txt"
       - ".github/workflows/node-migration-image.yml"
       - ".dockerignore"
   workflow_dispatch:
@@ -26,7 +38,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: node-migration-image-${{ github.ref }}
+  group: node-service-image-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -80,7 +92,15 @@ jobs:
             type=raw,value=node-migration-edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=node-migration-sha-,format=long
             type=ref,event=pr,prefix=node-migration-pr-
-      - name: Build and optionally push Node migration image
+      - id: registration-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=registration-edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=registration-sha-,format=long
+            type=ref,event=pr,prefix=registration-pr-
+      - name: Build and optionally push Node service image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -101,5 +121,17 @@ jobs:
           push: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.push_image) }}
           tags: ${{ steps.migration-meta.outputs.tags }}
           labels: ${{ steps.migration-meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and optionally push registration worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: registration-worker
+          platforms: linux/amd64,linux/arm64
+          push: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.push_image) }}
+          tags: ${{ steps.registration-meta.outputs.tags }}
+          labels: ${{ steps.registration-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -116,3 +116,35 @@ test("streaming chat forwards bridged chunks and terminal marker", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("admin account probe targets the requested SQLite account", async () => {
+  let authorization = "";
+  const upstream = createServer((request, response) => { authorization = String(request.headers.authorization || ""); writeResponsesStream(response); });
+  const upstreamPort = await listen(upstream);
+  const dir = mkdtempSync(join(tmpdir(), "grok2api-account-probe-test-"));
+  const store = new SqliteStore(join(dir, "app.sqlite"));
+  store.migrate();
+  store.saveAccount({ id: "account-probe", payload: { access_token: "probe-token" } });
+  const api = createApiServer({
+    adminStore: store,
+    adminUsername: "admin",
+    adminPassword: "secret",
+    chatService: new ChatService(store, `http://127.0.0.1:${upstreamPort}/v1`, "grok-4.5", "round_robin"),
+  });
+  const apiPort = await api.listen("127.0.0.1", 0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${apiPort}/admin/api/accounts/account-probe/probe`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-admin-username": "admin", "x-admin-password": "secret" },
+      body: JSON.stringify({ model: "grok-4.5" }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(authorization, "Bearer probe-token");
+    assert.equal((await response.json() as { ok: boolean }).ok, true);
+  } finally {
+    await api.close();
+    await close(upstream);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

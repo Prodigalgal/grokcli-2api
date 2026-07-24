@@ -156,6 +156,22 @@ export interface UsageTotals {
   readonly cacheReadTokens: number;
 }
 
+export interface UsageBreakdown extends UsageTotals {
+  readonly id: string;
+}
+
+export interface UsageSeriesPoint extends UsageTotals {
+  readonly day: string;
+}
+
+export interface OperationalLog {
+  readonly id: string;
+  readonly type: string;
+  readonly status: string;
+  readonly createdAt: number | null;
+  readonly detail: Record<string, unknown>;
+}
+
 export interface AccountInput {
   readonly id: string;
   readonly email?: string | null;
@@ -1022,6 +1038,25 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     };
   }
 
+  listSettings(): Record<string, unknown> {
+    const rows = this.db.prepare("SELECT key, value_json FROM app_settings ORDER BY key").all() as Array<{ key: string; value_json: string }>;
+    return Object.fromEntries(rows.map((row) => [row.key, JSON.parse(row.value_json) as unknown]));
+  }
+
+  updateSettings(settings: Readonly<Record<string, unknown>>, now = Date.now()): number {
+    const statement = this.db.prepare(`
+      INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+    `);
+    this.transaction(() => {
+      for (const [key, value] of Object.entries(settings)) {
+        if (!key.trim()) throw new Error("setting key cannot be empty");
+        statement.run(key.trim(), JSON.stringify(value), now);
+      }
+    });
+    return Object.keys(settings).length;
+  }
+
   migrationVerificationData(): {
     readonly accounts: readonly {
       readonly id: string;
@@ -1158,6 +1193,57 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
       };
     };
     return { today: totals("AND day = ?", [chinaDay(now)]), total: totals("", []) };
+  }
+
+  usageSeries(days = 14, now = Date.now()): UsageSeriesPoint[] {
+    const since = now - Math.max(1, Math.min(365, days)) * 86_400_000;
+    const rows = this.db.prepare(`
+      SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch') AS day,
+             COUNT(*) AS requests, SUM(success) AS success, SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS fail,
+             SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens,
+             SUM(total_tokens) AS total_tokens, SUM(cache_read_tokens) AS cache_read_tokens
+      FROM usage_events WHERE created_at >= ? GROUP BY day ORDER BY day
+    `).all(since) as Array<{ day: string; requests: number; success: number; fail: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cache_read_tokens: number }>;
+    return rows.map((row) => ({ day: row.day, ...usageTotalsFromRow(row) }));
+  }
+
+  usageBreakdown(dimension: "api_key_id" | "account_id" | "model", limit = 100): UsageBreakdown[] {
+    const safeLimit = Math.max(1, Math.min(500, limit));
+    const rows = this.db.prepare(`
+      SELECT COALESCE(${dimension}, '') AS id, COUNT(*) AS requests, SUM(success) AS success,
+             SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS fail, SUM(prompt_tokens) AS prompt_tokens,
+             SUM(completion_tokens) AS completion_tokens, SUM(total_tokens) AS total_tokens,
+             SUM(cache_read_tokens) AS cache_read_tokens
+      FROM usage_events GROUP BY ${dimension} ORDER BY total_tokens DESC, requests DESC LIMIT ?
+    `).all(safeLimit) as Array<{ id: string; requests: number; success: number; fail: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cache_read_tokens: number }>;
+    return rows.map((row) => ({ id: row.id || "unknown", ...usageTotalsFromRow(row) }));
+  }
+
+  usageEvents(limit = 100): Array<Record<string, unknown>> {
+    return this.db.prepare(`
+      SELECT request_id, api_key_id, account_id, model, protocol, success, prompt_tokens,
+             completion_tokens, total_tokens, cache_read_tokens, created_at
+      FROM usage_events ORDER BY created_at DESC LIMIT ?
+    `).all(Math.max(1, Math.min(500, limit))) as Array<Record<string, unknown>>;
+  }
+
+  listOperationalLogs(limit = 100): OperationalLog[] {
+    const taskLogs = this.automationTasks().list({ limit: Math.max(1, Math.min(500, limit)) }).map((task) => ({
+      id: task.id, type: task.kind, status: task.status, createdAt: task.createdAt,
+      detail: { result: task.result, error: task.error, attempts: task.attempts },
+    }));
+    const legacy = (this.db.prepare(`
+      SELECT source_table, legacy_id, created_at, payload_json FROM legacy_history ORDER BY created_at DESC LIMIT ?
+    `).all(Math.max(1, Math.min(500, limit))) as Array<{ source_table: string; legacy_id: string; created_at: number | null; payload_json: string }>).map((row) => {
+      const detail = JSON.parse(row.payload_json) as Record<string, unknown>;
+      return { id: `legacy:${row.source_table}:${row.legacy_id}`, type: row.source_table, status: String(detail.status ?? "historical"), createdAt: row.created_at, detail };
+    });
+    return [...taskLogs, ...legacy].sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0)).slice(0, limit);
+  }
+
+  exportAccounts(): Record<string, Record<string, unknown>> {
+    const rows = this.db.prepare("SELECT id, payload_json FROM accounts ORDER BY id").all() as Array<{ id: string; payload_json: string }>;
+    return Object.fromEntries(rows.map((row) => [row.id, JSON.parse(row.payload_json) as Record<string, unknown>]));
   }
 
   applyPoolSnapshot(input: PoolSnapshotInput, now = Date.now()): void {
@@ -1451,6 +1537,18 @@ interface UsageTotalsRow {
   readonly completion_tokens: number;
   readonly total_tokens: number;
   readonly cache_read_tokens: number;
+}
+
+function usageTotalsFromRow(row: UsageTotalsRow): UsageTotals {
+  return {
+    requests: row.requests ?? 0,
+    success: row.success ?? 0,
+    fail: row.fail ?? 0,
+    promptTokens: row.prompt_tokens ?? 0,
+    completionTokens: row.completion_tokens ?? 0,
+    totalTokens: row.total_tokens ?? 0,
+    cacheReadTokens: row.cache_read_tokens ?? 0,
+  };
 }
 
 function accountSummary(row: AccountSummaryRow): AccountSummary {

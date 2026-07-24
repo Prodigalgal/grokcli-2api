@@ -6,8 +6,7 @@ They are intentionally not wired into the live Argo CD application yet.
 1. Let GitHub Actions publish `ghcr.io/prodigalgal/grok2api:node-edge` and
    `ghcr.io/prodigalgal/grok2api:node-migration-edge`.
 2. The template explicitly sets `GROK2API_XAI_UPSTREAM_BASE_URL` to the direct
-   xAI CLI Responses endpoint `https://cli-chat-proxy.grok.com/v1`; do not
-   replace it with a CPA or other relay endpoint.
+   xAI CLI Responses endpoint `https://cli-chat-proxy.grok.com/v1`.
 3. Stop old registration and maintenance, take a PostgreSQL backup, then apply
    the suspended exporter Job. It reads the in-cluster PostgreSQL Service and
    writes `/app/data-node/migration/snapshot.json` to `grok2api-node-data`.
