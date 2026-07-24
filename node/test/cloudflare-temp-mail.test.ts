@@ -32,3 +32,27 @@ test("Cloudflare Temp Mail creates a mailbox and extracts verification codes", a
   assert.deepEqual(messages[0]?.codes, ["123456"]);
   assert.equal(calls.some((url) => url.endsWith("/api/new_address")), false);
 });
+
+test("Cloudflare Temp Mail recovers an existing inbox by address", async () => {
+  const client = new CloudflareTempMailClient({
+    baseUrl: "https://mail.example.test",
+    adminPassword: "private-admin-password",
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      assert.equal(new Headers(init?.headers).get("x-admin-auth"), "private-admin-password");
+      if (url.includes("/admin/address?")) {
+        assert.match(url, /query=member%40mail\.example\.test/);
+        return new Response(JSON.stringify({ results: [{ id: "address-7", name: "member", domain: "mail.example.test" }] }), { status: 200 });
+      }
+      if (url.endsWith("/admin/show_password/address-7")) {
+        return new Response(JSON.stringify({ jwt: "short-lived-inbox-token" }), { status: 200 });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    },
+  });
+  assert.deepEqual(await client.recoverMailbox("Member@mail.example.test"), {
+    id: "address-7",
+    address: "member@mail.example.test",
+    accessToken: "short-lived-inbox-token",
+  });
+});

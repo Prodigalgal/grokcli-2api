@@ -7,7 +7,6 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { issueApiKey } from "../auth/api-key-manager.js";
 import { requireApiKey, type ApiKeyAuthConfig, type ApiKeyStore } from "../auth/api-key-auth.js";
 import type { ChatService } from "../chat/service.js";
-import type { DeviceLoginService } from "../auth/device-login-service.js";
 import type { AutomationTaskRepository, AutomationTask } from "../automation/task-repository.js";
 import type { AutomationTaskWorker } from "../automation/task-worker.js";
 import { openAiModelList, type ModelStore } from "../models/catalog.js";
@@ -27,7 +26,6 @@ export interface ApiServerOptions {
   readonly defaultModel?: string;
   readonly apiKeyAuth?: ApiKeyAuthConfig;
   readonly chatService?: ChatService | null;
-  readonly deviceLogins?: DeviceLoginService | null;
   readonly automationTasks?: AutomationTaskRepository | null;
   readonly automationWorker?: Pick<AutomationTaskWorker, "cancel"> | null;
   readonly registrationAvailable?: boolean;
@@ -133,7 +131,6 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   let defaultModel = options.defaultModel?.trim() || "grok-4.5";
   const apiKeyAuth: ApiKeyAuthConfig = options.apiKeyAuth ?? { legacyApiKey: null, requireApiKey: "auto" };
   const chatService = options.chatService ?? null;
-  const deviceLogins = options.deviceLogins ?? null;
   const automationTasks = options.automationTasks ?? null;
   const automationWorker = options.automationWorker ?? null;
   const registrationAvailable = options.registrationAvailable ?? true;
@@ -497,90 +494,6 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       : reply.code(404).header("cache-control", "no-store").send({ detail: "API key was not found" });
   });
 
-  app.post("/admin/api/device/login", async (request, reply) => {
-    if (!requireAdmin(request, reply)) {
-      return reply;
-    }
-    if (!deviceLogins) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "device login is unavailable" });
-    }
-    const body = requestBody(request);
-    const accountId = typeof body.account_id === "string" ? body.account_id.trim() : "";
-    const session = await deviceLogins.start(accountId || undefined);
-    return reply.header("cache-control", "no-store").send({ ok: true, session });
-  });
-
-  app.get("/admin/api/device/sessions", async (request, reply) => {
-    if (!requireAdmin(request, reply)) {
-      return reply;
-    }
-    if (!deviceLogins) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "device login is unavailable" });
-    }
-    const sessions = deviceLogins.list();
-    return reply.header("cache-control", "no-store").send({ ok: true, sessions, count: sessions.length });
-  });
-
-  app.get("/admin/api/device/sessions/:id", async (request, reply) => {
-    if (!requireAdmin(request, reply)) {
-      return reply;
-    }
-    if (!deviceLogins) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "device login is unavailable" });
-    }
-    const id = (request.params as { id?: string }).id?.trim() || "";
-    const session = deviceLogins.get(id);
-    return session
-      ? reply.header("cache-control", "no-store").send({ ok: true, session })
-      : reply.code(404).header("cache-control", "no-store").send({ detail: "device login session was not found" });
-  });
-
-  app.post("/admin/api/device/sessions/:id/restart", async (request, reply) => {
-    if (!requireAdmin(request, reply)) {
-      return reply;
-    }
-    if (!deviceLogins) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "device login is unavailable" });
-    }
-    const id = (request.params as { id?: string }).id?.trim() || "";
-    const previous = deviceLogins.get(id);
-    if (!previous) {
-      return reply.code(404).header("cache-control", "no-store").send({ detail: "device login session was not found" });
-    }
-    const session = await deviceLogins.start(previous.targetAccountId ?? undefined);
-    return reply.header("cache-control", "no-store").send({ ok: true, session });
-  });
-
-  const enqueueBrowserTask = async (request: FastifyRequest, reply: FastifyReply, kind: "browser_automation" | "registration") => {
-    if (!requireAdmin(request, reply)) {
-      return reply;
-    }
-    if (!automationTasks) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "automation tasks are unavailable" });
-    }
-    if (kind === "registration" && !registrationAvailable) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "registration mail or dedicated proxy is not configured" });
-    }
-    const body = requestBody(request);
-    const browser = body.browser;
-    if (!browser || Array.isArray(browser) || typeof browser !== "object") {
-      return reply.code(400).header("cache-control", "no-store").send({ detail: "browser task configuration is required" });
-    }
-    const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.trim()
-      ? body.idempotency_key.trim()
-      : `${kind}:${randomUUID()}`;
-    const mailbox = body.mailbox;
-    if (mailbox !== undefined && (Array.isArray(mailbox) || !mailbox || typeof mailbox !== "object")) {
-      return reply.code(400).header("cache-control", "no-store").send({ detail: "mailbox must be an object" });
-    }
-    const task = automationTasks.enqueue(kind, idempotencyKey, {
-      browser,
-      ...(kind === "registration" && mailbox ? { mailbox: mailbox as Record<string, unknown> } : {}),
-    });
-    return reply.code(202).header("cache-control", "no-store").send({ ok: true, task: publicTask(task) });
-  };
-
-  app.post("/admin/api/automation/browser", async (request, reply) => enqueueBrowserTask(request, reply, "browser_automation"));
   app.post("/admin/api/accounts/register", async (request, reply) => {
     if (!requireAdmin(request, reply)) return reply;
     if (!automationTasks || !registrationAvailable) {
@@ -705,8 +618,37 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
   });
 
   app.get("/admin/api/maintainer", async (request, reply) => {
-    if (!requireAdmin(request, reply)) return reply;
-    return reply.header("cache-control", "no-store").send({ ok: true, available: maintainer !== null });
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const tasks = automationTasks?.list({ limit: 500 }) ?? [];
+    const reauth = tasks.filter((task) => task.kind === "sso_reauth" || task.kind === "sso_email_reauth");
+    return reply.header("cache-control", "no-store").send({
+      ok: true, available: maintainer !== null, pool: store.poolSummary(),
+      reauth: {
+        queued: reauth.filter((task) => task.status === "queued").length,
+        running: reauth.filter((task) => task.status === "running" || task.status === "leased").length,
+        failed: reauth.filter((task) => task.status === "failed").length,
+      },
+    });
+  });
+  app.post("/admin/api/accounts/enable-all", async (request, reply) => {
+    const store = requireAdminStore(request, reply); if (!store) return reply;
+    const result = store.enableAllRecoverableAccounts();
+    let cancelledLegacyTasks = 0;
+    if (automationTasks) {
+      for (const task of automationTasks.listByStatus("waiting_input")) {
+        automationTasks.cancelPending(task.id);
+        cancelledLegacyTasks += 1;
+      }
+    }
+    let queued = 0;
+    if (automationTasks) {
+      const generation = Date.now();
+      for (const accountId of store.listAccountsNeedingReauth()) {
+        automationTasks.enqueue("sso_reauth", `sso_reauth:bulk:${generation}:${accountId}`, { accountId, trigger: "bulk_keepalive" });
+        queued += 1;
+      }
+    }
+    return reply.header("cache-control", "no-store").send({ ok: true, ...result, queued, cancelledLegacyTasks });
   });
   for (const path of ["/admin/api/maintainer/run", "/admin/api/accounts/refresh"]) {
     app.post(path, async (request, reply) => {
@@ -715,32 +657,6 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       return reply.header("cache-control", "no-store").send({ ok: true, result: await maintainer.runOnce(true) });
     });
   }
-  app.post("/admin/api/accounts/:id/email-login", async (request, reply) => {
-    const store = requireAdminStore(request, reply);
-    if (!store) {
-      return reply;
-    }
-    if (!automationTasks) {
-      return reply.code(503).header("cache-control", "no-store").send({ detail: "automation tasks are unavailable" });
-    }
-    const id = (request.params as { id?: string }).id?.trim() || "";
-    if (!store.getAccountSummary(id)) {
-      return reply.code(404).header("cache-control", "no-store").send({ detail: "account was not found" });
-    }
-    if (!store.getCloudflareMailboxCredential(id)) {
-      return reply.code(409).header("cache-control", "no-store").send({ detail: "account has no stored Cloudflare Temp Mail inbox; start device login instead" });
-    }
-    const body = requestBody(request);
-    const browser = body.browser;
-    if (!browser || Array.isArray(browser) || typeof browser !== "object") {
-      return reply.code(400).header("cache-control", "no-store").send({ detail: "browser task configuration is required" });
-    }
-    const idempotencyKey = typeof body.idempotency_key === "string" && body.idempotency_key.trim()
-      ? body.idempotency_key.trim()
-      : `sso_email_reauth:${id}:${randomUUID()}`;
-    const task = automationTasks.enqueue("sso_email_reauth", idempotencyKey, { accountId: id, browser });
-    return reply.code(202).header("cache-control", "no-store").send({ ok: true, task: publicTask(task) });
-  });
   app.get("/admin/api/accounts/register/availability", async (request, reply) => {
     if (!requireAdmin(request, reply)) {
       return reply;

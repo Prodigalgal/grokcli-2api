@@ -48,3 +48,29 @@ test("Cloudflare email-login runner reuses a private mailbox credential without 
   assert.equal(JSON.stringify(result).includes("private-mailbox-jwt"), false);
   assert.equal(JSON.stringify(result).includes("private-new-sso"), false);
 });
+
+test("Cloudflare email-login runner recovers an inbox at runtime", async () => {
+  const mail = new CloudflareTempMailClient({
+    baseUrl: "https://mail.example.test",
+    adminPassword: "private-admin-password",
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.includes("/admin/address?")) return new Response(JSON.stringify({ results: [{ id: "mailbox-2", address: "member@example.test" }] }));
+      if (url.endsWith("/admin/show_password/mailbox-2")) return new Response(JSON.stringify({ jwt: "runtime-token" }));
+      if (url.includes("/api/parsed_mails")) return new Response(JSON.stringify({ results: [{ text: "Code 112233" }] }));
+      throw new Error(`unexpected URL ${url}`);
+    },
+  });
+  const browser: SsoCookieCaptureRunner = {
+    async run() { return {}; },
+    async runWithSsoCookie(_request, runtime) {
+      assert.equal(await runtime?.waitForMailCode?.(), "112233");
+      return { result: {}, ssoCookie: "new-sso" };
+    },
+  };
+  const runner = new CloudflareEmailLoginTaskRunner(browser, mail, {
+    getAccount: () => ({ id: "account-2", email: "member@example.test" }),
+    getCloudflareMailboxCredential: () => null,
+  }, { async restoreFromSsoCookie(accountId) { return { accountId, email: "member@example.test" }; } });
+  assert.equal((await runner.run({ accountId: "account-2", browser: { url: "https://accounts.example.test", actions: [] } })).recoveredBy, "email_code");
+});

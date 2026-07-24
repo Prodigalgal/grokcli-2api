@@ -77,7 +77,6 @@ const emailLoginRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
   : null;
 const taskWorker = new AutomationTaskWorker({
   store,
-  deviceLogins,
   ssoReauth,
   browserRunner,
   registrationRunner,
@@ -90,7 +89,6 @@ const server = createApiServer({
   defaultModel: runtimeDefaultModel,
   apiKeyAuth: { legacyApiKey: config.legacyApiKey, requireApiKey: config.requireApiKey },
   chatService: new ChatService(store, config.upstreamBase, runtimeDefaultModel, runtimePoolMode, usageRecorder),
-  deviceLogins,
   automationTasks: store.automationTasks(),
   automationWorker: taskWorker,
   registrationAvailable: config.automationWorkerEnabled && registrationRunner !== null,
@@ -132,7 +130,6 @@ if (config.tokenMaintainerEnabled) {
   maintainer.start();
 }
 if (config.automationWorkerEnabled) {
-  deviceLogins.resume();
   taskWorker.start();
 }
 usageRecorder.start();

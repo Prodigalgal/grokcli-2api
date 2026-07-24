@@ -22,6 +22,7 @@ export interface BrowserTaskRuntime {
 }
 
 type BrowserAction =
+  | { readonly type: "xai_email_login" }
   | { readonly type: "click"; readonly selector: string }
   | { readonly type: "fill"; readonly selector: string; readonly value: string }
   | { readonly type: "press"; readonly selector: string; readonly key: string }
@@ -61,7 +62,9 @@ export class PlaywrightBrowserTaskRunner implements BrowserTaskRunner {
       await page.goto(spec.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
       for (const action of spec.actions) {
         runtime.signal?.throwIfAborted();
-        if (action.type === "click") {
+        if (action.type === "xai_email_login") {
+          await completeXaiEmailLogin(page, context, runtime);
+        } else if (action.type === "click") {
           await page.locator(action.selector).click({ timeout: 30_000 });
         } else if (action.type === "fill") {
           await page.locator(action.selector).fill(resolveTemplate(action.value, runtime.variables), { timeout: 30_000 });
@@ -119,9 +122,10 @@ function parseAction(raw: unknown): BrowserAction {
   const action = raw as Record<string, unknown>;
   const type = typeof action.type === "string" ? action.type : "";
   const selector = typeof action.selector === "string" ? action.selector.trim() : "";
-  if (!["click", "fill", "press", "fill_mail_code", "wait_for_selector", "wait_for_url"].includes(type)) {
+  if (!["xai_email_login", "click", "fill", "press", "fill_mail_code", "wait_for_selector", "wait_for_url"].includes(type)) {
     throw new Error("browser task action type is not supported");
   }
+  if (type === "xai_email_login") return { type };
   if (type === "wait_for_url") {
     const url = typeof action.url === "string" ? action.url.trim() : "";
     if (!url) {
@@ -148,6 +152,45 @@ function parseAction(raw: unknown): BrowserAction {
     return { type: "fill_mail_code", selector };
   }
   return type === "click" ? { type: "click", selector } : { type: "wait_for_selector", selector };
+}
+
+async function completeXaiEmailLogin(page: import("playwright").Page, context: import("playwright").BrowserContext, runtime: BrowserTaskRuntime): Promise<void> {
+  const email = runtime.variables?.["account.email"] ?? "";
+  const password = runtime.variables?.["account.password"] ?? "";
+  if (!email) throw new Error("automatic xAI login requires an account email");
+  const emailInput = page.locator('input[type="email"], input[autocomplete="email"], input[name="email"], #email').first();
+  await emailInput.waitFor({ state: "visible", timeout: 30_000 });
+  await emailInput.fill(email);
+  await submitVisibleForm(page);
+  for (let round = 0; round < 4; round += 1) {
+    await page.waitForTimeout(1_500);
+    if (await hasSsoCookie(context)) return;
+    const passwordInput = page.locator('input[type="password"], input[autocomplete="current-password"]').first();
+    if (password && await passwordInput.isVisible().catch(() => false)) {
+      await passwordInput.fill(password);
+      await submitVisibleForm(page);
+      continue;
+    }
+    const codeInput = page.locator('input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name*="code" i]').first();
+    if (await codeInput.isVisible().catch(() => false)) {
+      if (!runtime.waitForMailCode) throw new Error("xAI requested an email code but no mailbox reader is available");
+      await codeInput.fill(await runtime.waitForMailCode());
+      await submitVisibleForm(page);
+      continue;
+    }
+  }
+  await page.waitForTimeout(2_000);
+  if (!await hasSsoCookie(context)) throw new Error("automatic xAI email login completed without an SSO cookie");
+}
+
+async function submitVisibleForm(page: import("playwright").Page): Promise<void> {
+  const submit = page.locator('button[type="submit"], form button').first();
+  if (await submit.isVisible().catch(() => false)) await submit.click({ timeout: 30_000 });
+  else await page.keyboard.press("Enter");
+}
+
+async function hasSsoCookie(context: import("playwright").BrowserContext): Promise<boolean> {
+  return (await context.cookies()).some((cookie) => cookie.name.toLowerCase() === "sso" || cookie.name.toLowerCase() === "sso-rw");
 }
 
 function resolveTemplate(value: string, variables: Readonly<Record<string, string>> | undefined): string {

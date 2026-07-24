@@ -88,6 +88,44 @@ export class CloudflareTempMailClient {
     return { id: stringValue(body.address_id) || stringValue(body.id) || address, address, accessToken };
   }
 
+  async recoverMailbox(address: string): Promise<CloudflareMailbox | null> {
+    const normalized = address.trim().toLowerCase();
+    if (!normalized.includes("@")) {
+      throw new Error("Cloudflare Temp Mail address is invalid");
+    }
+    const response = await this.request(`/admin/address?query=${encodeURIComponent(normalized)}&limit=20&offset=0`, {
+      method: "GET",
+      headers: adminHeaders(this.config.adminPassword),
+    });
+    if (!response.ok) {
+      throw new Error(`Cloudflare Temp Mail address lookup failed: HTTP ${response.status}`);
+    }
+    const data = await unknownJson(response, "Cloudflare Temp Mail address lookup");
+    const rows = arrayRows(data);
+    const match = rows.find((row) => addressFromRow(row).toLowerCase() === normalized);
+    if (!match) {
+      return null;
+    }
+    const id = stringValue(match.id) || stringValue(match.address_id);
+    if (!id) {
+      throw new Error("Cloudflare Temp Mail address lookup returned no address id");
+    }
+    const tokenResponse = await this.request(`/admin/show_password/${encodeURIComponent(id)}`, {
+      method: "GET",
+      headers: adminHeaders(this.config.adminPassword),
+    });
+    if (!tokenResponse.ok) {
+      throw new Error(`Cloudflare Temp Mail inbox credential refresh failed: HTTP ${tokenResponse.status}`);
+    }
+    const tokenData = await objectJson(tokenResponse, "Cloudflare Temp Mail inbox credential response");
+    const tokenBody = objectValue(tokenData.data) ?? tokenData;
+    const accessToken = stringValue(tokenBody.jwt) || stringValue(tokenBody.token);
+    if (!accessToken) {
+      throw new Error("Cloudflare Temp Mail inbox credential response was incomplete");
+    }
+    return { id, address: addressFromRow(match) || normalized, accessToken };
+  }
+
   async fetchMessages(mailbox: CloudflareMailbox): Promise<MailMessage[]> {
     const response = await this.request("/api/parsed_mails?limit=20&offset=0", {
       method: "GET",
@@ -172,15 +210,38 @@ function stringValue(value: unknown): string {
 }
 
 async function objectJson(response: Response, label: string): Promise<Record<string, unknown>> {
+  const value = await unknownJson(response, label);
+  if (isRecord(value)) {
+    return value;
+  }
+  throw new Error(`${label} was not valid JSON`);
+}
+
+async function unknownJson(response: Response, label: string): Promise<unknown> {
   try {
-    const value = await response.json() as unknown;
-    if (isRecord(value)) {
-      return value;
-    }
+    return await response.json() as unknown;
   } catch {
     // Stable error below; no response body is included because it can contain mailbox data.
   }
   throw new Error(`${label} was not valid JSON`);
+}
+
+function arrayRows(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.filter(isRecord);
+  if (!isRecord(value)) return [];
+  const body = objectValue(value.data) ?? value;
+  for (const key of ["results", "addresses", "items", "data"]) {
+    if (Array.isArray(body[key])) return body[key].filter(isRecord);
+  }
+  return [];
+}
+
+function addressFromRow(row: Record<string, unknown>): string {
+  const direct = stringValue(row.address) || stringValue(row.email);
+  if (direct) return direct;
+  const name = stringValue(row.name);
+  const domain = stringValue(row.domain);
+  return name && domain ? `${name}@${domain}` : "";
 }
 
 function delay(milliseconds: number): Promise<void> {

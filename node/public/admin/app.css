@@ -125,3 +125,8 @@ code { color: #27513a; background: #f3f6f4; border-color: #d6dfd9; }
 .settings-form .tool-surface { display: grid; gap: 14px; }
 .settings-form button { width: max-content; }
 .compact-table { min-width: 0; }
+.workbench-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+.workbench-head h1 { margin: 0 0 5px; color: #1d3025; font-size: 20px; letter-spacing: 0; }
+.workbench-head p { margin: 0; color: #6c7971; }
+.registration-settings { min-height: 0; margin: 12px 0; }
+button.danger { background: #fff; color: #b83c3c; border-color: #d8aaaa; }

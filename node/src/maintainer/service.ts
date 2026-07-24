@@ -53,6 +53,15 @@ export class TokenMaintainer {
     }
     this.running = true;
     try {
+      const retryBucket = Math.floor(Date.now() / 3_600_000);
+      for (const accountId of this.options.store.listAccountsNeedingReauth(this.options.config.tokenRefreshBatch)) {
+        this.options.store.automationTasks().enqueue(
+          "sso_reauth",
+          `sso_reauth:scheduled:${retryBucket}:${accountId}`,
+          { accountId, trigger: "automatic_keepalive" },
+        );
+        this.options.store.markSsoReauthQueued(accountId);
+      }
       const candidates = this.options.store.listRefreshCandidates({
         skewMs: this.options.config.tokenRefreshSkewMs,
         limit: this.options.config.tokenRefreshBatch,

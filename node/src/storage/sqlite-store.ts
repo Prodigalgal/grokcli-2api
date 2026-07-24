@@ -1465,6 +1465,35 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
     );
   }
 
+  enableAllRecoverableAccounts(now = Date.now()): { enabled: number; banned: number } {
+    const banned = this.db.prepare(`
+      SELECT COUNT(*) AS total FROM account_pool
+      WHERE lower(COALESCE(disabled_reason, '')) LIKE '%banned%'
+         OR lower(COALESCE(disabled_reason, '')) LIKE '%suspended%'
+         OR lower(COALESCE(disabled_reason, '')) LIKE '%封禁%'
+    `).get() as { total: number };
+    const result = this.db.prepare(`
+      UPDATE account_pool
+      SET enabled = 1, disabled_for_quota = 0, disabled_reason = NULL,
+          cooldown_until = NULL, pool_status = 'normal', updated_at = ?
+      WHERE lower(COALESCE(disabled_reason, '')) NOT LIKE '%banned%'
+        AND lower(COALESCE(disabled_reason, '')) NOT LIKE '%suspended%'
+        AND lower(COALESCE(disabled_reason, '')) NOT LIKE '%封禁%'
+    `).run(now);
+    return { enabled: Number(result.changes), banned: banned.total };
+  }
+
+  listAccountsNeedingReauth(limit = 1_000): string[] {
+    const rows = this.db.prepare(`
+      SELECT a.id FROM accounts a JOIN account_pool p ON p.account_id = a.id
+      WHERE p.enabled = 1
+        AND (json_extract(a.payload_json, '$.refresh_invalid') = 1 OR (a.expires_at IS NOT NULL AND a.expires_at <= ?))
+        AND (p.sso_reauth_next_at IS NULL OR p.sso_reauth_next_at <= ?)
+      ORDER BY COALESCE(a.expires_at, 0), a.id LIMIT ?
+    `).all(Date.now(), Date.now(), Math.max(1, Math.min(limit, 5_000))) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
   deleteAccount(id: string): boolean {
     return this.db.prepare("DELETE FROM accounts WHERE id = ?").run(id).changes === 1;
   }

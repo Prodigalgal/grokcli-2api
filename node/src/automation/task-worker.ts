@@ -1,4 +1,3 @@
-import type { DeviceLoginService } from "../auth/device-login-service.js";
 import type { SsoReauthService } from "../auth/sso-reauth-service.js";
 import type { AppConfig } from "../config.js";
 import type { SqliteStore } from "../storage/sqlite-store.js";
@@ -6,7 +5,6 @@ import type { BrowserTaskRunner } from "./browser-task-runner.js";
 
 export interface AutomationTaskWorkerOptions {
   readonly store: SqliteStore;
-  readonly deviceLogins: DeviceLoginService;
   readonly ssoReauth: Pick<SsoReauthService, "reauthenticate">;
   readonly browserRunner: BrowserTaskRunner;
   readonly registrationRunner?: BrowserTaskRunner | null;
@@ -55,7 +53,6 @@ export class AutomationTaskWorker {
     }
     this.running = true;
     try {
-      this.reconcileWaitingDeviceLogins();
       const tasks = this.options.store.automationTasks();
       const task = tasks.claimNext(this.owner, this.options.config.workerLeaseMs);
       if (!task) {
@@ -87,7 +84,14 @@ export class AutomationTaskWorker {
           tasks.succeed(task.id, this.owner, result);
         } catch (error) {
           if (controller.signal.aborted) tasks.cancelRunning(task.id, this.owner);
-          else tasks.fail(task.id, this.owner, messageFor(error));
+          else {
+            const reason = messageFor(error);
+            if (task.kind === "sso_email_reauth") {
+              const accountId = typeof task.request.accountId === "string" ? task.request.accountId : "";
+              if (accountId) this.options.store.markSsoReauthFailure(accountId, reason, this.options.config.ssoReauthCooldownMs);
+            }
+            tasks.fail(task.id, this.owner, reason);
+          }
         } finally {
           this.active.delete(task.id);
         }
@@ -112,37 +116,12 @@ export class AutomationTaskWorker {
     } catch (error) {
       const reason = messageFor(error);
       this.options.store.markSsoReauthFailure(accountId, reason, this.options.config.ssoReauthCooldownMs);
-      try {
-        const session = await this.options.deviceLogins.start(accountId);
-        tasks.waitForInput(taskId, this.owner, {
-          accountId,
-          recovery: "device_login",
-          deviceLoginSessionId: session.id,
-          userCode: session.userCode,
-          verificationUrl: session.verificationUrl,
-          expiresAt: session.expiresAt,
-        });
-      } catch (deviceError) {
-        tasks.fail(taskId, this.owner, `SSO recovery failed and device login could not start: ${messageFor(deviceError)}`);
-      }
-    }
-  }
-
-  private reconcileWaitingDeviceLogins(): void {
-    const tasks = this.options.store.automationTasks();
-    for (const task of tasks.listByStatus("waiting_input", "sso_reauth")) {
-      const sessionId = typeof task.result?.deviceLoginSessionId === "string" ? task.result.deviceLoginSessionId : "";
-      if (!sessionId) {
-        continue;
-      }
-      const session = this.options.store.getDeviceLoginSession(sessionId);
-      if (session?.status === "succeeded") {
-        tasks.succeedWaitingForInput(task.id, {
-          accountId: session.accountId,
-          recoveredBy: "device_login",
-          deviceLoginSessionId: session.id,
-        });
-      }
+      tasks.fail(taskId, this.owner, `saved SSO recovery failed; automatic email login queued: ${reason}`);
+      tasks.enqueue("sso_email_reauth", `sso_email_reauth:auto:${accountId}:${Date.now()}`, {
+        accountId,
+        trigger: "saved_sso_invalid",
+        browser: { url: "https://accounts.x.ai/sign-in", actions: [{ type: "xai_email_login" }] },
+      });
     }
   }
 }

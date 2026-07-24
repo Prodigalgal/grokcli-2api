@@ -1,5 +1,5 @@
 const pathTab = location.pathname.split("/").filter(Boolean).at(-1);
-const initialTab = ["accounts", "keys", "models", "usage", "logs", "settings"].includes(pathTab) ? pathTab : "overview";
+const initialTab = ["accounts", "keys", "models", "tasks", "keepalive", "usage", "logs", "settings"].includes(pathTab) ? pathTab : "overview";
 const state = { username: sessionStorage.getItem("grok2api-admin-username") || "admin", password: sessionStorage.getItem("grok2api-admin-password") || "", tab: initialTab, accountPage: 1 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -74,7 +74,7 @@ async function loadAccounts() {
   $("#accounts-body").innerHTML = data.accounts.map((account) => `<tr>
     <td><strong>${escapeHtml(account.email || account.id)}</strong><br><small>${escapeHtml(account.id)}</small></td>
     <td>${status(account.poolStatus)}</td><td>${account.weight}</td><td>${account.requestCount}</td><td>${date(account.expiresAt)}</td>
-    <td><div class="row-actions"><button type="button" data-account-toggle="${escapeHtml(account.id)}" data-enabled="${account.enabled}">${account.enabled ? "停用" : "启用"}</button>${account.hasEmailMailbox ? `<button type="button" data-account-email="${escapeHtml(account.id)}">邮箱码</button>` : ""}<button type="button" data-account-device="${escapeHtml(account.id)}">设备码</button></div></td>
+    <td><div class="row-actions"><button type="button" data-account-toggle="${escapeHtml(account.id)}" data-enabled="${account.enabled}">${account.enabled ? "停用" : "启用"}</button></div></td>
   </tr>`).join("") || `<tr><td colspan="6">没有匹配账号</td></tr>`;
   $("#account-pagination").innerHTML = `<button type="button" ${data.page <= 1 ? "disabled" : ""} id="page-prev">上一页</button><span>${data.page || 0} / ${data.totalPages || 0}，共 ${data.total || 0} 个</span><button type="button" ${data.page >= data.totalPages ? "disabled" : ""} id="page-next">下一页</button>`;
   $("#page-prev")?.addEventListener("click", () => { state.accountPage -= 1; void loadAccounts(); });
@@ -83,8 +83,6 @@ async function loadAccounts() {
     await api(`/admin/api/accounts/${encodeURIComponent(button.dataset.accountToggle)}/enabled`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) });
     await loadAccounts();
   }));
-  $$('[data-account-device]').forEach((button) => button.addEventListener("click", () => void startDeviceLogin(button.dataset.accountDevice)));
-  $$('[data-account-email]').forEach((button) => button.addEventListener("click", () => emailLoginDialog(button.dataset.accountEmail)));
 }
 
 async function loadKeys() {
@@ -95,17 +93,24 @@ async function loadKeys() {
   $$('[data-key-rotate]').forEach((button) => button.addEventListener("click", async () => { const data = await api(`/admin/api/keys/${encodeURIComponent(button.dataset.keyRotate)}/regenerate`, { method: "POST" }); showSecret(data.secret); await loadKeys(); }));
 }
 
-async function loadDevices() {
-  const data = await api("/admin/api/device/sessions");
-  $("#devices-body").innerHTML = data.sessions.map((session) => `<tr><td><strong>${escapeHtml(session.userCode)}</strong></td><td>${status(session.status)}</td><td>${escapeHtml(session.email || session.targetAccountId || "-")}</td><td>${date(session.expiresAt)}</td><td><div class="row-actions"><button type="button" data-device-open="${escapeHtml(session.verificationUrl)}">打开验证页</button></div></td></tr>`).join("") || `<tr><td colspan="5">没有设备登录会话</td></tr>`;
-  $$('[data-device-open]').forEach((button) => button.addEventListener("click", () => window.open(button.dataset.deviceOpen, "_blank", "noopener")));
-}
-
 async function loadTasks() {
-  const data = await api("/admin/api/automation/tasks?limit=100");
-  $("#tasks-body").innerHTML = data.tasks.map((task) => `<tr><td>${escapeHtml(task.kind)}</td><td>${status(task.status)}</td><td>${task.attempts}</td><td>${date(task.updatedAt)}</td><td><button type="button" data-task-detail="${escapeHtml(task.id)}">查看详情</button></td><td><div class="row-actions">${["queued", "running", "waiting_input"].includes(task.status) ? `<button type="button" data-task-cancel="${escapeHtml(task.id)}">停止</button>` : ""}</div></td></tr>`).join("") || `<tr><td colspan="6">没有自动化任务</td></tr>`;
+  const [data, availability] = await Promise.all([api("/admin/api/automation/tasks?limit=100"), api("/admin/api/accounts/register/availability")]);
+  const tasks = data.tasks.filter((task) => task.kind === "registration");
+  const counts = Object.fromEntries(["queued", "running", "succeeded", "failed"].map((key) => [key, tasks.filter((task) => task.status === key || (key === "running" && task.status === "leased")).length]));
+  $("#registration-metrics").innerHTML = [["等待", counts.queued], ["运行", counts.running], ["成功", counts.succeeded], ["失败", counts.failed]].map(([name, value]) => `<div class="metric"><span>${name}</span><strong>${value}</strong></div>`).join("");
+  $("#registration-domain").value = availability.defaults?.mail_domain || "未配置";
+  $("#registration-proxy").value = availability.defaults?.proxy_configured ? "已配置" : "未配置";
+  $("#registration-count").value = localStorage.getItem("grok2api-registration-count") || "1";
+  $("#tasks-body").innerHTML = tasks.map((task) => `<tr><td>账号注册</td><td>${status(task.status)}</td><td>${task.attempts}</td><td>${date(task.updatedAt)}</td><td><button type="button" data-task-detail="${escapeHtml(task.id)}">查看详情</button></td><td><div class="row-actions">${["queued", "running"].includes(task.status) ? `<button type="button" data-task-cancel="${escapeHtml(task.id)}">停止</button>` : ""}</div></td></tr>`).join("") || `<tr><td colspan="6">暂无注册任务</td></tr>`;
   $$('[data-task-cancel]').forEach((button) => button.addEventListener("click", async () => { await api(`/admin/api/automation/tasks/${encodeURIComponent(button.dataset.taskCancel)}/cancel`, { method: "POST" }); await loadTasks(); }));
   $$('[data-task-detail]').forEach((button) => button.addEventListener("click", () => void showTaskDetail(button.dataset.taskDetail)));
+}
+
+async function loadKeepalive() {
+  const data = await api("/admin/api/maintainer");
+  const pool = data.pool || {};
+  $("#keepalive-metrics").innerHTML = [["账号总数", pool.total || 0], ["已启用", pool.enabled || 0], ["可用", pool.live || 0], ["已过期", pool.expired || 0]].map(([name, value]) => `<div class="metric"><span>${name}</span><strong>${value}</strong></div>`).join("");
+  $("#reauth-summary").innerHTML = summary(data.reauth, { queued: "等待", running: "处理中", failed: "失败" });
 }
 
 async function loadModels() {
@@ -154,8 +159,8 @@ async function loadTab() {
     if (state.tab === "accounts") await loadAccounts();
     if (state.tab === "keys") await loadKeys();
     if (state.tab === "models") await loadModels();
-    if (state.tab === "device") await loadDevices();
     if (state.tab === "tasks") await loadTasks();
+    if (state.tab === "keepalive") await loadKeepalive();
     if (state.tab === "usage") await loadUsage();
     if (state.tab === "logs") await loadLogs();
     if (state.tab === "settings") await loadSettings();
@@ -175,12 +180,6 @@ function dialog(title, fields, submit) {
     catch (error) { const message = $("#dialog-error"); message.textContent = error.message || "操作失败"; message.hidden = false; }
   };
   $("#form-dialog").showModal();
-}
-
-async function startDeviceLogin(accountId = "") {
-  const data = await api("/admin/api/device/login", { method: "POST", body: JSON.stringify(accountId ? { account_id: accountId } : {}) });
-  window.open(data.session.verificationUrl, "_blank", "noopener");
-  showTab("device");
 }
 
 function showSecret(secret) {
@@ -204,11 +203,12 @@ $("#logout-button").addEventListener("click", () => { sessionStorage.removeItem(
 $("#refresh-button").addEventListener("click", () => { void loadConnection(); void loadTab(); });
 $$('[data-tab]').forEach((button) => button.addEventListener("click", () => showTab(button.dataset.tab)));
 $("#account-search").addEventListener("click", () => { state.accountPage = 1; void loadAccounts(); });
-$("#device-start").addEventListener("click", () => void startDeviceLogin());
-$("#device-start-secondary").addEventListener("click", () => void startDeviceLogin());
 $("#key-create").addEventListener("click", () => dialog("创建 API Key", `<label>名称<input name="name" required maxlength="120"></label><label>备注<input name="note" maxlength="1000"></label>`, async (form) => { const data = await api("/admin/api/keys", { method: "POST", body: JSON.stringify({ name: form.get("name"), note: form.get("note") }) }); showSecret(data.secret); }));
-$("#registration-start").addEventListener("click", () => void registrationDialog());
-$("#automation-start").addEventListener("click", () => browserTaskDialog("浏览器任务", "/admin/api/automation/browser"));
+$("#registration-save").addEventListener("click", () => { localStorage.setItem("grok2api-registration-count", $("#registration-count").value); setConnection("注册设置已保存", "ready"); });
+$("#registration-start").addEventListener("click", async () => { await api("/admin/api/accounts/register", { method: "POST", body: JSON.stringify({ count: Number($("#registration-count").value) }) }); await loadTasks(); });
+$("#registration-stop").addEventListener("click", async () => { const data = await api("/admin/api/automation/tasks?limit=500"); for (const task of data.tasks.filter((item) => item.kind === "registration" && ["queued", "running"].includes(item.status))) await api(`/admin/api/automation/tasks/${encodeURIComponent(task.id)}/cancel`, { method: "POST" }).catch(() => undefined); await loadTasks(); });
+$("#keepalive-run").addEventListener("click", async () => { await api("/admin/api/maintainer/run", { method: "POST" }); await loadKeepalive(); });
+$("#keepalive-enable-all").addEventListener("click", async () => { const result = await api("/admin/api/accounts/enable-all", { method: "POST", body: "{}" }); setConnection(`已启用 ${result.enabled} 个，重授权排队 ${result.queued} 个`, "ready"); await loadKeepalive(); });
 $("#models-sync").addEventListener("click", async () => { await api("/admin/api/models/sync", { method: "POST" }); await loadModels(); });
 $("#logs-refresh").addEventListener("click", () => void loadLogs());
 $("#maintainer-run").addEventListener("click", async () => { await api("/admin/api/maintainer/run", { method: "POST" }); await loadAccounts(); });
@@ -227,30 +227,6 @@ $("#settings-form").addEventListener("submit", async (event) => {
   setConnection("设置已保存", "ready");
 });
 $("#copy-secret").addEventListener("click", async () => { await navigator.clipboard.writeText($("#issued-secret").textContent || ""); });
-
-function browserTaskDialog(title, endpoint) {
-  dialog(title, `<label>目标网址<input name="url" type="url" value="https://accounts.x.ai/" required></label><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
-    const body = { browser: { url: String(form.get("url")), actions: [] }, idempotency_key: String(form.get("idempotency_key") || "") || undefined };
-    await api(endpoint, { method: "POST", body: JSON.stringify(body) });
-  });
-}
-
-async function registrationDialog() {
-  const availability = await api("/admin/api/accounts/register/availability");
-  const defaults = availability.defaults || {};
-  dialog("启动注册机", `<div class="form-grid"><label>注册数量<input name="count" type="number" min="1" max="20" value="1" required></label><label>代理订阅<input name="proxy" type="url" placeholder="留空使用服务器代理池"></label><label>Temp Mail 地址<input name="mail_base" type="url" value="${escapeHtml(defaults.mail_base_url || "")}" required></label><label>邮箱域名<input name="mail_domain" value="${escapeHtml(defaults.mail_domain || "")}" required></label><label class="wide">Temp Mail 密钥<input name="mail_key" type="password" placeholder="留空使用服务器配置"></label></div>`, async (form) => {
-    await api("/admin/api/accounts/register", { method: "POST", body: JSON.stringify({ count: Number(form.get("count")), proxy_subscription_url: String(form.get("proxy") || ""), mail_base_url: String(form.get("mail_base") || ""), mail_domain: String(form.get("mail_domain") || ""), mail_api_key: String(form.get("mail_key") || "") }) });
-    showTab("tasks");
-  });
-}
-
-function emailLoginDialog(accountId) {
-  dialog("邮箱验证码重登", `<p>将使用该账号已保存的 Cloudflare Temp Mail 邮箱接收验证码。</p><label>幂等键（可选）<input name="idempotency_key"></label>`, async (form) => {
-    const body = { browser: { url: "https://accounts.x.ai/", actions: [{ type: "fill", selector: "#email", value: "{{account.email}}" }] }, idempotency_key: String(form.get("idempotency_key") || "") || undefined };
-    await api(`/admin/api/accounts/${encodeURIComponent(accountId)}/email-login`, { method: "POST", body: JSON.stringify(body) });
-    showTab("tasks");
-  });
-}
 
 $("#admin-username").value = state.username;
 if (state.password) { $("#admin-password").value = state.password; $("#login-form").requestSubmit(); }

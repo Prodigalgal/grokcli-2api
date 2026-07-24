@@ -33,8 +33,8 @@
           <button type="button" data-tab="accounts">账号</button>
           <button type="button" data-tab="keys">密钥</button>
           <button type="button" data-tab="models">模型</button>
-          <button type="button" data-tab="device">设备登录</button>
-          <button type="button" data-tab="tasks">自动化</button>
+          <button type="button" data-tab="tasks">注册机</button>
+          <button type="button" data-tab="keepalive">保活</button>
           <button type="button" data-tab="usage">用量</button>
           <button type="button" data-tab="logs">日志</button>
           <button type="button" data-tab="settings">设置</button>
@@ -56,7 +56,6 @@
             <label class="search">筛选账号<input id="account-query" type="search" placeholder="账号 ID、邮箱或用户 ID"></label>
             <select id="account-status"><option value="">全部状态</option><option value="active">可用</option><option value="disabled">已停用</option><option value="quota_disabled">额度停用</option><option value="cooldown">冷却中</option><option value="expired">已过期</option></select>
             <button id="account-search" type="button">查询</button>
-            <button id="device-start" type="button">设备登录</button>
           </div>
           <div class="table-wrap"><table><thead><tr><th>账号</th><th>状态</th><th>权重</th><th>请求</th><th>过期</th><th></th></tr></thead><tbody id="accounts-body"></tbody></table></div>
           <div id="account-pagination" class="pagination"></div>
@@ -67,17 +66,21 @@
           <div class="table-wrap"><table><thead><tr><th>名称</th><th>密钥</th><th>状态</th><th>请求</th><th>Token</th><th></th></tr></thead><tbody id="keys-body"></tbody></table></div>
         </section>
 
-        <section data-panel="device" class="panel">
-          <div class="toolbar"><button id="device-start-secondary" type="button">新建设备登录</button></div>
-          <div class="table-wrap"><table><thead><tr><th>用户代码</th><th>状态</th><th>账号</th><th>到期</th><th></th></tr></thead><tbody id="devices-body"></tbody></table></div>
-        </section>
 
         <section data-panel="tasks" class="panel">
-          <div class="toolbar">
-            <button id="registration-start" type="button">启动注册机</button>
-            <button id="automation-start" type="button">浏览器任务</button>
+          <div class="workbench-head">
+            <div><h1>批量注册</h1><p>使用服务器配置的 CF Temp Mail 与独立代理池创建账号。</p></div>
+            <div class="toolbar"><button id="registration-save" type="button" class="quiet">保存设置</button><button id="registration-start" type="button">启动批量注册</button><button id="registration-stop" type="button" class="danger">停止任务</button></div>
           </div>
+          <div id="registration-metrics" class="metrics"></div>
+            <section class="tool-surface registration-settings"><h2>注册设置</h2><div class="form-grid"><label>成功目标<input id="registration-count" type="number" min="1" max="20" value="1"></label><label>执行并发<input value="1" disabled></label><label>邮箱域名<input id="registration-domain" readonly></label><label>代理池<input id="registration-proxy" readonly></label></div></section>
           <div class="table-wrap"><table><thead><tr><th>类型</th><th>状态</th><th>尝试</th><th>更新时间</th><th>日志</th><th></th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+        </section>
+
+        <section data-panel="keepalive" class="panel">
+          <div class="workbench-head"><div><h1>账号保活</h1><p>自动刷新有效凭据；失效账号进入重授权队列，明确封禁后才停止。</p></div><div class="toolbar"><button id="keepalive-run" type="button" class="quiet">立即扫描</button><button id="keepalive-enable-all" type="button">全部启用并重授权</button></div></div>
+          <div id="keepalive-metrics" class="metrics"></div>
+          <div class="split-grid"><section class="tool-surface"><h2>运行策略</h2><div class="summary-list"><div><span>自动保活</span><strong>运行中</strong></div><div><span>邮箱取信</span><strong>实时恢复</strong></div><div><span>停止条件</span><strong>明确封禁</strong></div></div></section><section class="tool-surface"><h2>重授权队列</h2><div id="reauth-summary" class="summary-list"></div></section></div>
         </section>
 
         <section data-panel="models" class="panel">
