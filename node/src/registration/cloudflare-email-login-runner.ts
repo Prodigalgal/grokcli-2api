@@ -36,6 +36,12 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     if (!account) {
       throw new Error("account was not found");
     }
+    const password = accountPassword(account.payload);
+    if (this.passwordReauth && password && account.email) {
+      const authentication = await this.passwordReauth.reauthenticate(account.email, password);
+      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, authentication.sso, authentication.token);
+      return { accountId: restored.accountId, email: restored.email ?? account.email, recoveredBy: "legacy_local_solver_protocol" };
+    }
     const mailbox = this.accounts.getCloudflareMailboxCredential(accountId)
       ?? (account.email ? await this.mail.recoverMailbox(account.email) : null);
     if (!mailbox) {
@@ -45,12 +51,6 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
       throw new Error("email login browser runner cannot capture the authenticated SSO cookie");
     }
     const email = account.email ?? mailbox.address;
-    const password = accountPassword(account.payload);
-    if (this.passwordReauth && password) {
-      const authentication = await this.passwordReauth.reauthenticate(email, password);
-      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, authentication.sso, authentication.token);
-      return { accountId: restored.accountId, email: restored.email ?? email, recoveredBy: "legacy_local_solver_protocol" };
-    }
     const captured = await this.browser.runWithSsoCookie(request, {
       variables: {
         "account.email": email,

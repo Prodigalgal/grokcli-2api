@@ -80,7 +80,7 @@ test("Cloudflare email-login runner prefers the legacy local-solver protocol", a
   const browser: SsoCookieCaptureRunner = { run: async () => { throw new Error("browser should not run"); }, runWithSsoCookie: async () => { throw new Error("browser should not run"); } };
   const runner = new CloudflareEmailLoginTaskRunner(browser, mail, {
     getAccount: () => ({ id: "account-3", email: "member@example.test", payload: { password: "private-password" } }),
-    getCloudflareMailboxCredential: () => ({ id: "mail-3", address: "member@example.test", accessToken: "private-mail-token" }),
+    getCloudflareMailboxCredential: () => null,
   }, {
     async restoreFromSsoCookie(accountId, sso, token) {
       assert.equal(sso, "worker-sso");
