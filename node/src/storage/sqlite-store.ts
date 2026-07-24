@@ -1479,6 +1479,8 @@ export class SqliteStore implements ApiKeyStore, ModelStore {
       WHERE lower(COALESCE(disabled_reason, '')) NOT LIKE '%banned%'
         AND lower(COALESCE(disabled_reason, '')) NOT LIKE '%suspended%'
         AND lower(COALESCE(disabled_reason, '')) NOT LIKE '%封禁%'
+        AND (enabled <> 1 OR disabled_for_quota <> 0 OR disabled_reason IS NOT NULL
+          OR cooldown_until IS NOT NULL OR pool_status <> 'normal')
     `).run(now);
     return { enabled: Number(result.changes), banned: banned.total };
   }

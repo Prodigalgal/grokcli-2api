@@ -643,7 +643,7 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     let queued = 0;
     if (automationTasks) {
       const generation = Date.now();
-      for (const accountId of store.listAccountsNeedingReauth()) {
+      for (const accountId of store.listAccountsNeedingReauth(20)) {
         automationTasks.enqueue("sso_reauth", `sso_reauth:bulk:${generation}:${accountId}`, { accountId, trigger: "bulk_keepalive" });
         queued += 1;
       }
