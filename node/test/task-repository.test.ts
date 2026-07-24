@@ -72,6 +72,18 @@ test("pending tasks can be listed and cancelled without racing an active worker"
   }
 });
 
+test("registration tasks are claimed before background reauthorization", () => {
+  const { db, repo, dir } = createRepository();
+  try {
+    repo.enqueue("sso_email_reauth", "background-reauth", { accountId: "account-1" }, 1_000);
+    const registration = repo.enqueue("registration", "interactive-registration", { browser: {} }, 2_000);
+    assert.equal(repo.claimNext("worker-a", 10_000, 3_000)?.id, registration.id);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("running registration tasks record logs and can be cancelled by their owner", () => {
   const { db, repo, dir } = createRepository();
   try {

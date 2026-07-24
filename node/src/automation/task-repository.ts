@@ -193,7 +193,10 @@ export class AutomationTaskRepository {
     }
     this.recoverExpired(now);
     const candidate = this.db.prepare(`
-      SELECT id FROM automation_tasks WHERE status = 'queued' ORDER BY created_at, id LIMIT 1
+      SELECT id FROM automation_tasks
+      WHERE status = 'queued'
+      ORDER BY CASE WHEN kind = 'registration' THEN 0 ELSE 1 END, created_at, id
+      LIMIT 1
     `).get() as { id: string } | undefined;
     if (!candidate) {
       return null;
