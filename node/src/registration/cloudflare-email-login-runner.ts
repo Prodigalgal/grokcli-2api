@@ -11,11 +11,11 @@ export interface EmailLoginAccountStore {
 }
 
 export interface SsoEmailLoginConverter {
-  restoreFromSsoCookie(accountId: string, ssoCookie: string): Promise<{ readonly accountId: string; readonly email: string | null }>;
+  restoreFromSsoCookie(accountId: string, ssoCookie: string, tokenData?: Record<string, unknown>): Promise<{ readonly accountId: string; readonly email: string | null }>;
 }
 
 export interface PasswordReauthClient {
-  reauthenticate(email: string, password: string): Promise<string>;
+  reauthenticate(email: string, password: string): Promise<{ readonly sso: string; readonly token: Record<string, unknown> }>;
 }
 
 export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
@@ -47,8 +47,8 @@ export class CloudflareEmailLoginTaskRunner implements BrowserTaskRunner {
     const email = account.email ?? mailbox.address;
     const password = accountPassword(account.payload);
     if (this.passwordReauth && password) {
-      const sso = await this.passwordReauth.reauthenticate(email, password);
-      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, sso);
+      const authentication = await this.passwordReauth.reauthenticate(email, password);
+      const restored = await this.ssoConverter.restoreFromSsoCookie(accountId, authentication.sso, authentication.token);
       return { accountId: restored.accountId, email: restored.email ?? email, recoveredBy: "legacy_local_solver_protocol" };
     }
     const captured = await this.browser.runWithSsoCookie(request, {

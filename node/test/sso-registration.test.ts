@@ -73,3 +73,41 @@ test("authenticated browser SSO cookie is converted into a durable SQLite accoun
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("legacy protocol token restores an account without another Cloudflare request", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "grok2api-protocol-reauth-test-"));
+  const store = new SqliteStore(join(directory, "app.sqlite"));
+  store.migrate();
+  const accessToken = ["header", Buffer.from(JSON.stringify({ principal_id: "user-2", email: "member@example.test", exp: 1_900_000_000 })).toString("base64url"), "signature"].join(".");
+  store.saveAccount({
+    id: "account-2",
+    email: "member@example.test",
+    userId: "user-2",
+    teamId: null,
+    payload: { key: "expired-token" },
+    expiresAt: 1,
+  });
+  const config = {
+    oidcDeviceUrl: "https://auth.example.test/device/code",
+    oidcTokenUrl: "https://auth.example.test/token",
+    oidcClientId: "test-client",
+    oidcScopes: "openid offline_access",
+  };
+  const fetchImpl: typeof fetch = async () => { throw new Error("Cloudflare request must not run"); };
+  const deviceLogins = new DeviceLoginService({ store, config, autoPoll: false, fetchImpl });
+  const service = new SsoReauthService({ store, deviceLogins, config, fetchImpl });
+  try {
+    const output = await service.restoreFromSsoCookie("account-2", "private-sso", {
+      access_token: accessToken,
+      refresh_token: "private-refresh-token",
+      expires_in: 3600,
+    });
+    assert.equal(output.accountId, "account-2");
+    const account = store.getAccount("account-2");
+    assert.equal(account?.payload.sso, "private-sso");
+    assert.equal(account?.payload.refresh_token, "private-refresh-token");
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

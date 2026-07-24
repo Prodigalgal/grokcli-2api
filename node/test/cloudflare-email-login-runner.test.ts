@@ -82,15 +82,16 @@ test("Cloudflare email-login runner prefers the legacy local-solver protocol", a
     getAccount: () => ({ id: "account-3", email: "member@example.test", payload: { password: "private-password" } }),
     getCloudflareMailboxCredential: () => ({ id: "mail-3", address: "member@example.test", accessToken: "private-mail-token" }),
   }, {
-    async restoreFromSsoCookie(accountId, sso) {
+    async restoreFromSsoCookie(accountId, sso, token) {
       assert.equal(sso, "worker-sso");
+      assert.equal(token?.access_token, "worker-access");
       return { accountId, email: "member@example.test" };
     },
   }, {
     async reauthenticate(email, password) {
       assert.equal(email, "member@example.test");
       assert.equal(password, "private-password");
-      return "worker-sso";
+      return { sso: "worker-sso", token: { access_token: "worker-access" } };
     },
   });
   assert.equal((await runner.run({ accountId: "account-3" })).recoveredBy, "legacy_local_solver_protocol");

@@ -43,7 +43,7 @@ export class SsoReauthService {
     return { accountId: saved.id, email: saved.email };
   }
 
-  async restoreFromSsoCookie(accountId: string, ssoCookie: string): Promise<{ readonly accountId: string; readonly email: string | null }> {
+  async restoreFromSsoCookie(accountId: string, ssoCookie: string, tokenData?: Record<string, unknown>): Promise<{ readonly accountId: string; readonly email: string | null }> {
     const account = this.options.store.getAccount(accountId);
     if (!account) {
       throw new Error("account was not found");
@@ -52,7 +52,7 @@ export class SsoReauthService {
     if (!sso) {
       throw new Error("authenticated browser session did not contain an SSO cookie");
     }
-    const token = await this.exchangeSsoCookie(sso);
+    const token = stringValue(tokenData?.access_token) ? tokenData! : await this.exchangeSsoCookie(sso);
     const restored = this.options.deviceLogins.restoreTokens(account.id, token, this.options.config.oidcClientId);
     const saved = this.persistSso(restored.id, sso, account.email, "browser-email-relogin");
     return { accountId: saved.id, email: saved.email };
