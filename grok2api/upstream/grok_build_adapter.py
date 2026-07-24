@@ -3488,7 +3488,11 @@ def _run_registration(
         }
         from grok2api.upstream.sso_device_flow import exchange_sso_for_token
 
-        oauth_token = exchange_sso_for_token(str(sso), proxy=str(proxy or ""))
+        oauth_token = exchange_sso_for_token(
+            str(sso),
+            proxy=str(proxy or ""),
+            initial_delay=float(os.environ.get("GROK2API_REG_OAUTH_SETTLE_SEC", "45") or 45),
+        )
         sess["auth_json"] = {
             "external_registration": {
                 "sso": str(sso),
