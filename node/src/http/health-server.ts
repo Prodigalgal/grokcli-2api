@@ -32,7 +32,6 @@ export interface ApiServerOptions {
   readonly registrationDefaults?: {
     readonly mailBaseUrl: string | null;
     readonly mailDomain: string | null;
-    readonly proxyConfigured: boolean;
   };
   readonly adminStore?: SqliteStore | null;
   readonly adminUsername?: string | null;
@@ -506,12 +505,11 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
     }
     const text = (value: unknown): string => typeof value === "string" ? value.trim() : "";
     const registration = {
-      proxySubscriptionUrl: text(body.proxy_subscription_url),
       mailBaseUrl: text(body.mail_base_url),
       mailApiKey: text(body.mail_api_key),
       mailDomain: text(body.mail_domain),
     };
-    for (const [name, value] of [["proxy subscription", registration.proxySubscriptionUrl], ["mail base URL", registration.mailBaseUrl]] as const) {
+    for (const [name, value] of [["mail base URL", registration.mailBaseUrl]] as const) {
       if (value && !value.startsWith("https://")) {
         return reply.code(400).header("cache-control", "no-store").send({ detail: `${name} must use https` });
       }
@@ -667,10 +665,9 @@ export function createApiServer(options: ApiServerOptions = {}): HealthServer {
       defaults: {
         mail_base_url: options.registrationDefaults?.mailBaseUrl ?? null,
         mail_domain: options.registrationDefaults?.mailDomain ?? null,
-        proxy_configured: options.registrationDefaults?.proxyConfigured ?? false,
         mail_configured: Boolean(options.registrationDefaults?.mailBaseUrl),
       },
-      ...(registrationAvailable ? {} : { detail: "registration mail or dedicated proxy is not configured" }),
+      ...(registrationAvailable ? {} : { detail: "registration mail is not configured" }),
     });
   });
   app.get("/admin/api/automation/tasks", async (request, reply) => {

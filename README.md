@@ -12,7 +12,7 @@
 - API Key 创建、停用、轮换与用量统计
 - 账号 JSON 导入导出、单账号/批量测活、模型目录
 - OIDC Token 自动续期、SSO 恢复与设备码登录
-- Cloudflare Temp Mail 注册、邮箱验证码重登、独立 sing-box 注册代理
+- Cloudflare Temp Mail 注册、邮箱验证码重登、节点出口直连
 - 可恢复的自动化任务、任务日志和管理端操作记录
 - MiMo 风格桌面管理台：概览、账号、密钥、模型、设备登录、自动化、用量、日志、设置
 
@@ -23,7 +23,7 @@
 - Node.js `22.22.x`
 - 单实例运行，不支持多副本共享 SQLite
 - 生产环境需要持久化 `GROK2API_DATA_DIR`
-- 注册功能需要 Cloudflare Temp Mail 与 VLESS 订阅；其余 API 不依赖注册配置
+- 注册功能需要 Cloudflare Temp Mail；其余 API 不依赖注册配置
 
 ## 本地启动
 
@@ -67,7 +67,6 @@ GROK2API_ACCOUNT_MODE=round_robin
 GROK2API_CFMAIL_BASE_URL=https://mail.example.com
 GROK2API_CFMAIL_API_KEY=change-me
 GROK2API_CFMAIL_DOMAIN=example.com
-GROK2API_PROXY_SUB_URL=https://example.com/vless-subscription
 ```
 
 完整变量见 [`node/.env.example`](node/.env.example)。

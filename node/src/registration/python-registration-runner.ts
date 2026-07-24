@@ -1,7 +1,6 @@
 import type { BrowserTaskRunner } from "../automation/browser-task-runner.js";
 import type { BrowserTaskRuntime } from "../automation/browser-task-runner.js";
 import type { CloudflareMailboxCredentialStore, SsoRegistrationConverter } from "./cloudflare-registration-runner.js";
-import type { RegistrationProxyProvider } from "./sing-box-proxy-manager.js";
 
 interface PythonRegistrationOptions {
   readonly serviceUrl: string;
@@ -10,8 +9,6 @@ interface PythonRegistrationOptions {
   readonly cfMailBaseUrl: string;
   readonly cfMailAdminPassword: string;
   readonly cfMailDomain: string | null;
-  readonly proxyProvider: RegistrationProxyProvider;
-  readonly proxyProviderFactory?: (subscriptionUrl: string) => RegistrationProxyProvider;
   readonly ssoConverter: SsoRegistrationConverter;
   readonly mailboxStore: CloudflareMailboxCredentialStore;
   readonly fetchImpl?: typeof fetch;
@@ -26,24 +23,17 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
 
   async run(request: Record<string, unknown>, runtime: BrowserTaskRuntime = {}): Promise<Record<string, unknown>> {
     const registration = record(request.registration);
-    const subscriptionUrl = string(registration?.proxySubscriptionUrl);
-    const proxyProvider = subscriptionUrl && this.options.proxyProviderFactory
-      ? this.options.proxyProviderFactory(subscriptionUrl)
-      : this.options.proxyProvider;
-    let proxy: Awaited<ReturnType<RegistrationProxyProvider["acquire"]>> | null = null;
     let sessionId = "";
     let completed = false;
     let lastWorkerEvent = "";
     try {
-      proxy = await proxyProvider.acquire();
       const mailbox = record(request.mailbox);
       runtime.signal?.throwIfAborted();
-      runtime.onEvent?.({ type: "worker_started", message: "注册工作器已启动，已分配独立代理节点" });
+      runtime.onEvent?.({ type: "worker_started", message: "注册工作器已启动" });
       const started = await this.call("/internal/registration/v1/jobs", {
         captcha_provider: "local",
         local_solver_url: "http://127.0.0.1:5072",
-        proxy: proxy.server,
-        proxy_strategy: "sticky",
+        proxy: "",
         mail_provider: "cfmail",
         cfmail_base_url: string(registration?.mailBaseUrl) || this.options.cfMailBaseUrl,
         cfmail_api_key: string(registration?.mailApiKey) || this.options.cfMailAdminPassword,
@@ -104,8 +94,6 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
       if (sessionId && !completed) {
         await this.call(`/internal/registration/v1/sessions/${encodeURIComponent(sessionId)}/stop`, {}, "POST").catch(() => undefined);
       }
-      await proxy?.release();
-      if (proxyProvider !== this.options.proxyProvider) await proxyProvider.close();
     }
   }
 

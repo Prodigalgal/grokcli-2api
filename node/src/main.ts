@@ -1,6 +1,4 @@
 import { mkdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
 
 import { DeviceLoginService } from "./auth/device-login-service.js";
 import { SsoReauthService } from "./auth/sso-reauth-service.js";
@@ -13,7 +11,6 @@ import { TokenMaintainer } from "./maintainer/service.js";
 import { CloudflareRegistrationTaskRunner } from "./registration/cloudflare-registration-runner.js";
 import { CloudflareEmailLoginTaskRunner } from "./registration/cloudflare-email-login-runner.js";
 import { CloudflareTempMailClient } from "./registration/cloudflare-temp-mail.js";
-import { SingBoxRegistrationProxyManager } from "./registration/sing-box-proxy-manager.js";
 import { PythonRegistrationTaskRunner } from "./registration/python-registration-runner.js";
 import { PythonReauthClient } from "./registration/python-reauth-client.js";
 import { SingleInstanceLock } from "./runtime/single-instance-lock.js";
@@ -34,16 +31,7 @@ const maintainer = new TokenMaintainer({ store, config });
 const deviceLogins = new DeviceLoginService({ store, config });
 const ssoReauth = new SsoReauthService({ store, deviceLogins, config });
 const browserRunner = new PlaywrightBrowserTaskRunner();
-const registrationProxy = config.registrationProxySubscriptionUrl
-  ? new SingBoxRegistrationProxyManager({
-    subscriptionUrl: config.registrationProxySubscriptionUrl,
-    binaryPath: config.singBoxPath,
-    workDir: config.singBoxWorkDir,
-    startupTimeoutMs: config.singBoxStartupTimeoutMs,
-    tlsInsecure: config.registrationProxyTlsInsecure,
-  })
-  : null;
-const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword && registrationProxy
+const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
   ? config.registrationServiceUrl
     ? new PythonRegistrationTaskRunner({
       serviceUrl: config.registrationServiceUrl,
@@ -52,14 +40,6 @@ const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword &&
       cfMailBaseUrl: config.cfMailBaseUrl,
       cfMailAdminPassword: config.cfMailAdminPassword,
       cfMailDomain: config.cfMailDomain,
-      proxyProvider: registrationProxy,
-      proxyProviderFactory: (subscriptionUrl) => new SingBoxRegistrationProxyManager({
-        subscriptionUrl,
-        binaryPath: config.singBoxPath,
-        workDir: join(config.singBoxWorkDir, `custom-${randomUUID()}`),
-        startupTimeoutMs: config.singBoxStartupTimeoutMs,
-        tlsInsecure: config.registrationProxyTlsInsecure,
-      }),
       ssoConverter: ssoReauth,
       mailboxStore: store,
     })
@@ -67,7 +47,7 @@ const registrationRunner = config.cfMailBaseUrl && config.cfMailAdminPassword &&
     baseUrl: config.cfMailBaseUrl,
     adminPassword: config.cfMailAdminPassword,
     domain: config.cfMailDomain,
-  }), ssoReauth, store, registrationProxy)
+  }), ssoReauth, store)
   : null;
 const emailLoginRunner = config.cfMailBaseUrl && config.cfMailAdminPassword
   ? new CloudflareEmailLoginTaskRunner(browserRunner, new CloudflareTempMailClient({
@@ -100,7 +80,6 @@ const server = createApiServer({
   registrationDefaults: {
     mailBaseUrl: config.cfMailBaseUrl,
     mailDomain: config.cfMailDomain,
-    proxyConfigured: registrationProxy !== null,
   },
   adminStore: store,
   adminUsername: config.adminUsername,
@@ -117,7 +96,6 @@ async function stop(exitCode: number): Promise<void> {
   try {
     maintainer.stop();
     taskWorker.stop();
-    await registrationProxy?.close();
     usageRecorder.stop();
     await server.close();
   } finally {

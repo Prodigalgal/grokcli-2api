@@ -6,7 +6,6 @@ import { CloudflareRegistrationTaskRunner } from "../src/registration/cloudflare
 import { CloudflareTempMailClient } from "../src/registration/cloudflare-temp-mail.js";
 
 test("Cloudflare registration runner injects mailbox data and keeps the mailbox JWT private", async () => {
-  let proxyReleased = 0;
   const mail = new CloudflareTempMailClient({
     baseUrl: "https://mail.example.test",
     adminPassword: "private-admin-password",
@@ -24,7 +23,7 @@ test("Cloudflare registration runner injects mailbox data and keeps the mailbox 
   });
   const browser: SsoCookieCaptureRunner = {
     async run(request, runtime) {
-      assert.equal(runtime?.proxyServer, "http://127.0.0.1:17890");
+      assert.equal(runtime?.proxyServer, undefined);
       assert.equal(runtime?.variables?.["mailbox.address"], "new@mail.example.test");
       assert.equal(runtime?.variables?.["mailbox.email"], "new@mail.example.test");
       assert.equal(await runtime?.waitForMailCode?.(), "123456");
@@ -47,11 +46,6 @@ test("Cloudflare registration runner injects mailbox data and keeps the mailbox 
     saveCloudflareMailboxCredential(accountId, mailbox) {
       storedMailbox.push({ accountId, accessToken: mailbox.accessToken });
     },
-  }, {
-    async acquire() {
-      return { server: "http://127.0.0.1:17890", async release() { proxyReleased += 1; } };
-    },
-    async close() {},
   });
   const result = await runner.run({
     browser: {
@@ -68,11 +62,9 @@ test("Cloudflare registration runner injects mailbox data and keeps the mailbox 
   assert.equal(JSON.stringify(result).includes("private-mailbox-jwt"), false);
   assert.equal(JSON.stringify(result).includes("private-sso-cookie"), false);
   assert.deepEqual(storedMailbox, [{ accountId: "account-1", accessToken: "private-mailbox-jwt" }]);
-  assert.equal(proxyReleased, 1);
 });
 
-test("registration releases its dedicated proxy when browser automation fails", async () => {
-  let released = 0;
+test("direct registration reports browser automation failures", async () => {
   const browser: SsoCookieCaptureRunner = {
     async run() { throw new Error("browser failed"); },
     async runWithSsoCookie() { throw new Error("browser failed"); },
@@ -87,12 +79,6 @@ test("registration releases its dedicated proxy when browser automation fails", 
     async registerFromSsoCookie() { throw new Error("should not convert"); },
   }, {
     saveCloudflareMailboxCredential() {},
-  }, {
-    async acquire() {
-      return { server: "http://127.0.0.1:17891", async release() { released += 1; } };
-    },
-    async close() {},
   });
   await assert.rejects(() => runner.run({ browser: { url: "https://accounts.example.test", actions: [] } }), /browser failed/);
-  assert.equal(released, 1);
 });

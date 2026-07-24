@@ -99,7 +99,6 @@ async function loadTasks() {
   const counts = Object.fromEntries(["queued", "running", "succeeded", "failed"].map((key) => [key, tasks.filter((task) => task.status === key || (key === "running" && task.status === "leased")).length]));
   $("#registration-metrics").innerHTML = [["等待", counts.queued], ["运行", counts.running], ["成功", counts.succeeded], ["失败", counts.failed]].map(([name, value]) => `<div class="metric"><span>${name}</span><strong>${value}</strong></div>`).join("");
   $("#registration-domain").value = availability.defaults?.mail_domain || "未配置";
-  $("#registration-proxy").value = availability.defaults?.proxy_configured ? "已配置" : "未配置";
   $("#registration-count").value = localStorage.getItem("grok2api-registration-count") || "1";
   $("#tasks-body").innerHTML = tasks.map((task) => `<tr><td>账号注册</td><td>${status(task.status)}</td><td>${task.attempts}</td><td>${date(task.updatedAt)}</td><td><button type="button" data-task-detail="${escapeHtml(task.id)}">查看详情</button></td><td><div class="row-actions">${["queued", "running"].includes(task.status) ? `<button type="button" data-task-cancel="${escapeHtml(task.id)}">停止</button>` : ""}</div></td></tr>`).join("") || `<tr><td colspan="6">暂无注册任务</td></tr>`;
   $$('[data-task-cancel]').forEach((button) => button.addEventListener("click", async () => { await api(`/admin/api/automation/tasks/${encodeURIComponent(button.dataset.taskCancel)}/cancel`, { method: "POST" }); await loadTasks(); }));
