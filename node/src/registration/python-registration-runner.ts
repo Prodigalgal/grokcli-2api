@@ -61,12 +61,17 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
           const external = record(record(session.auth_json)?.external_registration);
           const sso = string(external?.sso);
           const email = string(external?.email);
+          const password = string(external?.password);
           const token = record(external?.token);
           const workerMailbox = record(external?.mailbox);
-          if (!sso || !email || !workerMailbox || !string(token?.access_token)) {
+          if (!sso || !email || !workerMailbox) {
             throw new Error("registration worker completed without protocol authentication");
           }
-          const account = await this.options.ssoConverter.registerFromSsoCookie(sso, email, token!);
+          const account = string(token?.access_token)
+            ? await this.options.ssoConverter.registerFromSsoCookie(sso, email, token!)
+            : password && this.options.ssoConverter.registerPendingAccount
+              ? await this.options.ssoConverter.registerPendingAccount(sso, email, password)
+              : (() => { throw new Error("registration token is pending but no lifecycle store is configured"); })();
           const mailboxId = string(workerMailbox.id);
           const mailboxAddress = string(workerMailbox.address) || email;
           const mailboxToken = string(workerMailbox.access_token);

@@ -102,3 +102,43 @@ test("Python registration worker stops a failed direct session", async () => {
   await assert.rejects(() => runner.run({}), /captcha rejected/);
   assert.equal(stopped, 1);
 });
+
+test("Python registration persists a pending account when fresh OAuth is not ready", async () => {
+  let pending = 0;
+  const runner = new PythonRegistrationTaskRunner({
+    serviceUrl: "http://127.0.0.1:18070",
+    token: null,
+    timeoutMs: 60_000,
+    cfMailBaseUrl: "https://mail.example.test",
+    cfMailAdminPassword: "mail-admin-password",
+    cfMailDomain: "mail.example.test",
+    ssoConverter: {
+      async registerFromSsoCookie() { throw new Error("token path should not run"); },
+      async registerPendingAccount(sso, email, password) {
+        assert.equal(sso, "pending-sso");
+        assert.equal(email, "pending@mail.example.test");
+        assert.equal(password, "private-password");
+        pending += 1;
+        return { accountId: "pending-account", email };
+      },
+    },
+    mailboxStore: { saveCloudflareMailboxCredential() {} },
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/internal/registration/v1/jobs")) return Response.json({ id: "pending-session" });
+      if (url.includes("/sessions/pending-session?include_auth_json=1")) return Response.json({
+        status: "completed",
+        auth_json: { external_registration: {
+          sso: "pending-sso",
+          token: {},
+          email: "pending@mail.example.test",
+          password: "private-password",
+          mailbox: { id: "mailbox-pending", address: "pending@mail.example.test", access_token: "mailbox-token" },
+        } },
+      });
+      throw new Error(`unexpected URL ${url}`);
+    },
+  });
+  assert.equal((await runner.run({})).accountId, "pending-account");
+  assert.equal(pending, 1);
+});

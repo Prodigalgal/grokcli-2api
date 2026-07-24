@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config.js";
+import { createHash } from "node:crypto";
 import type { SqliteStore } from "../storage/sqlite-store.js";
 import { DeviceLoginService } from "./device-login-service.js";
 
@@ -41,6 +42,38 @@ export class SsoReauthService {
     const restored = this.options.deviceLogins.restoreTokens(null, token, this.options.config.oidcClientId);
     const saved = this.persistSso(restored.id, sso, email, "browser-registration");
     return { accountId: saved.id, email: saved.email };
+  }
+
+  async registerPendingAccount(ssoCookie: string, email: string, password: string): Promise<{ readonly accountId: string; readonly email: string | null }> {
+    const sso = normalizeSso(ssoCookie);
+    const address = email.trim().toLowerCase();
+    if (!sso || !address || !password.trim()) {
+      throw new Error("pending registration requires SSO, email, and password");
+    }
+    const accountId = `pending:xai:${createHash("sha256").update(address).digest("hex").slice(0, 32)}`;
+    this.options.store.saveAccount({
+      id: accountId,
+      email: address,
+      userId: null,
+      teamId: null,
+      payload: {
+        email: address,
+        password: password.trim(),
+        register_password: password.trim(),
+        sso,
+        sso_cookie: sso,
+        auth_mode: "oidc",
+        source: "registration-pending-auth",
+      },
+      expiresAt: 0,
+    });
+    this.options.store.automationTasks().enqueue(
+      "sso_email_reauth",
+      `sso_email_reauth:registration:${accountId}:${Date.now()}`,
+      { accountId, trigger: "registration_pending_auth" },
+    );
+    this.options.store.markSsoReauthQueued(accountId);
+    return { accountId, email: address };
   }
 
   async restoreFromSsoCookie(accountId: string, ssoCookie: string, tokenData?: Record<string, unknown>): Promise<{ readonly accountId: string; readonly email: string | null }> {

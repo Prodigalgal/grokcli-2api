@@ -103,6 +103,28 @@ test("protocol registration token is persisted without another Cloudflare reques
   }
 });
 
+test("pending registration is durable and immediately queues automatic reauthorization", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "grok2api-pending-registration-test-"));
+  const store = new SqliteStore(join(directory, "app.sqlite"));
+  store.migrate();
+  const config = {
+    oidcDeviceUrl: "https://auth.example.test/device/code",
+    oidcTokenUrl: "https://auth.example.test/token",
+    oidcClientId: "test-client",
+    oidcScopes: "openid offline_access",
+  };
+  const deviceLogins = new DeviceLoginService({ store, config, autoPoll: false });
+  const service = new SsoReauthService({ store, deviceLogins, config });
+  try {
+    const output = await service.registerPendingAccount("pending-sso", "pending@example.test", "private-password");
+    assert.equal(store.getAccount(output.accountId)?.expiresAt, 0);
+    assert.equal(store.automationTasks().listByStatus("queued", "sso_email_reauth").length, 1);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("legacy protocol token restores an account without another Cloudflare request", async () => {
   const directory = mkdtempSync(join(tmpdir(), "grok2api-protocol-reauth-test-"));
   const store = new SqliteStore(join(directory, "app.sqlite"));

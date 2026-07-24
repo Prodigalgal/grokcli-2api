@@ -3486,20 +3486,27 @@ def _run_registration(
             "access_token": str(getattr(receiver, "token", "") or ""),
             "provider": str(getattr(receiver, "provider", "") or "cfmail"),
         }
-        time.sleep(
-            max(0.0, float(os.environ.get("GROK2API_REG_OAUTH_SETTLE_SEC", "45") or 45))
-        )
-        login = reauthenticate_account(
-            email=str(email or ""),
-            password=str(password or ""),
-            proxy=str(proxy or ""),
-        )
-        sso = str(login["sso"])
-        oauth_token = dict(login["token"])
+        oauth_token: dict[str, Any] = {}
+        auth_pending_reason = ""
+        try:
+            time.sleep(
+                max(0.0, float(os.environ.get("GROK2API_REG_OAUTH_SETTLE_SEC", "45") or 45))
+            )
+            login = reauthenticate_account(
+                email=str(email or ""),
+                password=str(password or ""),
+                proxy=str(proxy or ""),
+            )
+            sso = str(login["sso"])
+            oauth_token = dict(login["token"])
+        except Exception as exc:  # noqa: BLE001
+            auth_pending_reason = str(exc)[:300]
         sess["auth_json"] = {
             "external_registration": {
                 "sso": str(sso),
                 "token": oauth_token,
+                "pending_auth": not bool(oauth_token.get("access_token")),
+                "auth_pending_reason": auth_pending_reason,
                 "email": str(email or ""),
                 "password": str(password or ""),
                 "mailbox": mailbox,
