@@ -3486,9 +3486,13 @@ def _run_registration(
             "access_token": str(getattr(receiver, "token", "") or ""),
             "provider": str(getattr(receiver, "provider", "") or "cfmail"),
         }
+        from grok2api.upstream.sso_device_flow import exchange_sso_for_token
+
+        oauth_token = exchange_sso_for_token(str(sso), proxy=str(proxy or ""))
         sess["auth_json"] = {
             "external_registration": {
                 "sso": str(sso),
+                "token": oauth_token,
                 "email": str(email or ""),
                 "password": str(password or ""),
                 "mailbox": mailbox,

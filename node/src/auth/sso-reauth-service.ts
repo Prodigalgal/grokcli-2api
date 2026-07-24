@@ -32,12 +32,12 @@ export class SsoReauthService {
     return { accountId: restored.accountId };
   }
 
-  async registerFromSsoCookie(ssoCookie: string, email: string | null = null): Promise<{ readonly accountId: string; readonly email: string | null }> {
+  async registerFromSsoCookie(ssoCookie: string, email: string | null = null, tokenData?: Record<string, unknown>): Promise<{ readonly accountId: string; readonly email: string | null }> {
     const sso = normalizeSso(ssoCookie);
     if (!sso) {
       throw new Error("authenticated browser session did not contain an SSO cookie");
     }
-    const token = await this.exchangeSsoCookie(sso);
+    const token = stringValue(tokenData?.access_token) ? tokenData! : await this.exchangeSsoCookie(sso);
     const restored = this.options.deviceLogins.restoreTokens(null, token, this.options.config.oidcClientId);
     const saved = this.persistSso(restored.id, sso, email, "browser-registration");
     return { accountId: saved.id, email: saved.email };

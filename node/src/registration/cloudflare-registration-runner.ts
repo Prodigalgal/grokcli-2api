@@ -5,7 +5,7 @@ import {
 import { CloudflareTempMailClient } from "./cloudflare-temp-mail.js";
 
 export interface SsoRegistrationConverter {
-  registerFromSsoCookie(ssoCookie: string, email?: string | null): Promise<{ readonly accountId: string; readonly email: string | null }>;
+  registerFromSsoCookie(ssoCookie: string, email?: string | null, tokenData?: Record<string, unknown>): Promise<{ readonly accountId: string; readonly email: string | null }>;
 }
 
 export interface CloudflareMailboxCredentialStore {

@@ -61,11 +61,12 @@ export class PythonRegistrationTaskRunner implements BrowserTaskRunner {
           const external = record(record(session.auth_json)?.external_registration);
           const sso = string(external?.sso);
           const email = string(external?.email);
+          const token = record(external?.token);
           const workerMailbox = record(external?.mailbox);
-          if (!sso || !email || !workerMailbox) {
-            throw new Error("registration worker completed without an external SSO result");
+          if (!sso || !email || !workerMailbox || !string(token?.access_token)) {
+            throw new Error("registration worker completed without protocol authentication");
           }
-          const account = await this.options.ssoConverter.registerFromSsoCookie(sso, email);
+          const account = await this.options.ssoConverter.registerFromSsoCookie(sso, email, token!);
           const mailboxId = string(workerMailbox.id);
           const mailboxAddress = string(workerMailbox.address) || email;
           const mailboxToken = string(workerMailbox.access_token);

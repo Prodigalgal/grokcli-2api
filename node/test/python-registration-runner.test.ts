@@ -13,9 +13,10 @@ test("Python registration worker returns SSO to Node over direct egress", async 
     cfMailAdminPassword: "mail-admin-password",
     cfMailDomain: "mail.example.test",
     ssoConverter: {
-      async registerFromSsoCookie(sso, email) {
+      async registerFromSsoCookie(sso, email, token) {
         assert.equal(sso, "private-sso");
         assert.equal(email, "new@mail.example.test");
+        assert.equal(token?.access_token, "private-access-token");
         return { accountId: "account-1", email };
       },
     },
@@ -41,6 +42,7 @@ test("Python registration worker returns SSO to Node over direct egress", async 
           auth_json: {
             external_registration: {
               sso: "private-sso",
+              token: { access_token: "private-access-token", refresh_token: "private-refresh-token" },
               email: "new@mail.example.test",
               mailbox: { id: "mailbox-1", address: "new@mail.example.test", access_token: "private-mailbox-token" },
             },
