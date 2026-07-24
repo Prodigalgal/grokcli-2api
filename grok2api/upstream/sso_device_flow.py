@@ -20,7 +20,6 @@ def exchange_sso_for_token(
     proxy: str = "",
     session: Any | None = None,
     attempts: int = 6,
-    initial_delay: float = 0,
 ) -> dict[str, Any]:
     """Use a curl_cffi browser session to approve an OAuth device request."""
     cookie = str(sso or "").strip()
@@ -41,9 +40,6 @@ def exchange_sso_for_token(
     home = session.get("https://accounts.x.ai/", timeout=timeout, allow_redirects=True)
     if "sign-in" in str(home.url or "") or "sign-up" in str(home.url or ""):
         raise RuntimeError("protocol SSO cookie was rejected")
-    if initial_delay > 0:
-        time.sleep(min(180.0, float(initial_delay)))
-
     scopes = os.environ.get("GROK2API_OIDC_SCOPES", DEFAULT_SCOPES).strip()
     max_attempts = max(1, min(12, int(attempts)))
     last_error = "device flow did not start"

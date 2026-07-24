@@ -3486,13 +3486,16 @@ def _run_registration(
             "access_token": str(getattr(receiver, "token", "") or ""),
             "provider": str(getattr(receiver, "provider", "") or "cfmail"),
         }
-        from grok2api.upstream.sso_device_flow import exchange_sso_for_token
-
-        oauth_token = exchange_sso_for_token(
-            str(sso),
-            proxy=str(proxy or ""),
-            initial_delay=float(os.environ.get("GROK2API_REG_OAUTH_SETTLE_SEC", "45") or 45),
+        time.sleep(
+            max(0.0, float(os.environ.get("GROK2API_REG_OAUTH_SETTLE_SEC", "45") or 45))
         )
+        login = reauthenticate_account(
+            email=str(email or ""),
+            password=str(password or ""),
+            proxy=str(proxy or ""),
+        )
+        sso = str(login["sso"])
+        oauth_token = dict(login["token"])
         sess["auth_json"] = {
             "external_registration": {
                 "sso": str(sso),
